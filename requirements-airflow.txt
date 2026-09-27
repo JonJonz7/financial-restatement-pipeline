@@ -1,0 +1,9 @@
+# =============================================================================
+# Airflow Dependencies (separate from main requirements.txt)
+# =============================================================================
+# Install in Airflow containers or dedicated venvs only.
+# `pip install -r requirements-airflow.txt`
+# =============================================================================
+
+apache-airflow==2.8.0
+apache-airflow-providers-common-sql==1.11.0

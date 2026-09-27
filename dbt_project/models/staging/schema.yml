@@ -1,0 +1,104 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: >
+      Raw data ingested by the Python loader (ingestion/loader.py) into
+      the bronze schema of the DuckDB warehouse.
+    schema: bronze
+    tables:
+      - name: raw_filings
+        description: SEC EDGAR filing metadata (10-K, 10-Q, 10-K/A, etc.)
+        columns:
+          - name: accession_number
+            description: Unique SEC accession number for each filing
+            tests:
+              - not_null
+          - name: cik
+            description: SEC Central Index Key identifying the filer
+            tests:
+              - not_null
+          - name: form_type
+            description: SEC form type
+            tests:
+              - not_null
+              - accepted_values:
+                  values:
+                    - "10-K"
+                    - "10-Q"
+                    - "10-K/A"
+                    - "10-Q/A"
+                    - "8-K"
+                    - "20-F"
+                    - "6-K"
+
+      - name: raw_financial_facts
+        description: XBRL financial fact values extracted from SEC filings
+        columns:
+          - name: cik
+            tests:
+              - not_null
+          - name: metric
+            tests:
+              - not_null
+          - name: period_end
+            tests:
+              - not_null
+
+      - name: raw_market_data
+        description: Daily market / pricing data for publicly traded tickers
+        columns:
+          - name: ticker
+            tests:
+              - not_null
+          - name: date
+            tests:
+              - not_null
+
+models:
+  - name: stg_filings
+    description: >
+      Cleaned and deduplicated SEC filing metadata. One row per
+      accession_number.
+    columns:
+      - name: accession_number
+        tests:
+          - unique
+          - not_null
+      - name: cik
+        tests:
+          - not_null
+      - name: filed_date
+        tests:
+          - not_null
+
+  - name: stg_financial_facts
+    description: >
+      Cleaned financial facts with surrogate key. Null values filtered out.
+    columns:
+      - name: fact_key
+        description: >
+          Surrogate key: md5(cik || metric || period_end || filed_date)
+        tests:
+          - unique
+          - not_null
+      - name: cik
+        tests:
+          - not_null
+      - name: metric
+        tests:
+          - not_null
+      - name: value
+        tests:
+          - not_null
+
+  - name: stg_market_data
+    description: >
+      Cleaned and deduplicated market data. One row per (ticker, date).
+    columns:
+      - name: ticker
+        tests:
+          - not_null
+      - name: date
+        tests:
+          - not_null

@@ -1,0 +1,22 @@
+financial_restatement:
+  target: dev
+
+  outputs:
+    dev:
+      type: duckdb
+      path: ../warehouse.duckdb
+      threads: 4
+
+    # -----------------------------------------------------------------
+    # Production target (BigQuery) -- uncomment and fill in for prod
+    # -----------------------------------------------------------------
+    # prod:
+    #   type: bigquery
+    #   method: oauth            # or service-account
+    #   project: your-gcp-project-id
+    #   dataset: financial_restatement
+    #   threads: 8
+    #   timeout_seconds: 300
+    #   location: US
+    #   priority: interactive
+    #   retries: 3

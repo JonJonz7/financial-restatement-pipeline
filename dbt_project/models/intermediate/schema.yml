@@ -1,0 +1,63 @@
+version: 2
+
+models:
+  - name: int_filing_comparisons
+    description: >
+      Detects financial restatements by comparing successive filings
+      for the same (cik, metric, period_end). Each row represents a
+      case where a metric's reported value changed between filings.
+    columns:
+      - name: cik
+        tests:
+          - not_null
+      - name: metric
+        tests:
+          - not_null
+      - name: period_end
+        tests:
+          - not_null
+      - name: original_value
+        tests:
+          - not_null
+      - name: restated_value
+        tests:
+          - not_null
+      - name: original_filed_date
+        tests:
+          - not_null
+      - name: restatement_filed_date
+        tests:
+          - not_null
+      - name: absolute_change
+        description: restated_value minus original_value
+        tests:
+          - not_null
+      - name: pct_change
+        description: >
+          Percentage change from original to restated value.
+          Null only when original_value is zero.
+
+  - name: int_cross_source_validation
+    description: >
+      Flags discrepancies between SEC-reported financial figures and
+      market data. Only rows with FLAGGED or UNKNOWN status are kept.
+    columns:
+      - name: cik
+        tests:
+          - not_null
+      - name: ticker
+        tests:
+          - not_null
+      - name: metric
+        tests:
+          - not_null
+      - name: discrepancy_flag
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - "FLAGGED"
+                - "UNKNOWN"
+      - name: reported_value
+        tests:
+          - not_null

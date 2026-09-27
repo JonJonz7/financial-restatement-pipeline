@@ -1,0 +1,137 @@
+###############################################################################
+# Financial Restatement Pipeline — Docker Compose
+# --------------------------------------------------------------------------
+# Local development stack: Airflow (webserver + scheduler), DuckDB warehouse
+# (volume-mounted), and Streamlit dashboard.
+###############################################################################
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.0-python3.11
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'change-me-in-production'
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: 'America/New_York'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    # Pipeline-specific
+    DUCKDB_PATH: /data/warehouse.duckdb
+    DBT_PROJECT_DIR: /opt/airflow/dbt_project
+    DBT_PROFILES_DIR: /opt/airflow/dbt_project
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./dbt_project:/opt/airflow/dbt_project
+    - ./ingestion:/opt/airflow/ingestion
+    - ./detection:/opt/airflow/detection
+    - ./quality:/opt/airflow/quality
+    - warehouse-data:/data
+    - airflow-logs:/opt/airflow/logs
+  networks:
+    - pipeline-net
+
+services:
+  # -------------------------------------------------------------------------
+  # Warehouse — DuckDB file on a named volume
+  # -------------------------------------------------------------------------
+  warehouse:
+    image: alpine:3.19
+    command: >
+      sh -c "mkdir -p /data && touch /data/warehouse.duckdb && echo 'DuckDB volume ready' && tail -f /dev/null"
+    volumes:
+      - warehouse-data:/data
+    networks:
+      - pipeline-net
+    healthcheck:
+      test: ["CMD", "test", "-f", "/data/warehouse.duckdb"]
+      interval: 10s
+      retries: 3
+
+  # -------------------------------------------------------------------------
+  # Airflow — database init + admin user creation
+  # -------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command: >
+      -c "
+        airflow db init &&
+        airflow users create
+          --username admin
+          --password admin
+          --firstname Admin
+          --lastname User
+          --role Admin
+          --email admin@pipeline.local
+      "
+    restart: "no"
+    depends_on:
+      warehouse:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # Airflow Webserver
+  # -------------------------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # Airflow Scheduler
+  # -------------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # Streamlit Dashboard
+  # -------------------------------------------------------------------------
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >
+      streamlit run dashboard/app.py
+        --server.port=8501
+        --server.headless=true
+        --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    environment:
+      DUCKDB_PATH: /data/warehouse.duckdb
+    volumes:
+      - ./dashboard:/app/dashboard
+      - warehouse-data:/data
+    networks:
+      - pipeline-net
+    depends_on:
+      warehouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  warehouse-data:
+    driver: local
+  airflow-logs:
+    driver: local
+
+networks:
+  pipeline-net:
+    driver: bridge

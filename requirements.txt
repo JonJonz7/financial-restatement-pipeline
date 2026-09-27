@@ -1,0 +1,37 @@
+# =============================================================================
+# Financial Restatement Pipeline — Python Dependencies
+# =============================================================================
+# Airflow is intentionally excluded (see requirements-airflow.txt) because its
+# dependency tree is heavy and conflicts with data-science packages.
+# =============================================================================
+
+# Core warehouse & data manipulation
+duckdb==0.10.1
+pandas==2.2.0
+numpy==1.26.3
+
+# SEC EDGAR API & market data
+requests==2.31.0
+yfinance==0.2.36
+
+# dbt (DuckDB adapter)
+dbt-core==1.7.8
+dbt-duckdb==1.7.3
+
+# Data quality
+great-expectations==0.18.8
+
+# Dashboard
+streamlit==1.31.0
+plotly==5.18.0
+
+# Testing
+pytest==8.0.0
+pytest-cov==4.1.0
+
+# Linting
+ruff==0.2.1
+
+# Utilities
+python-dotenv==1.0.1
+pyyaml==6.0.1
