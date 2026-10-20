@@ -1,117 +1,52 @@
 version: 2
 
 models:
-  - name: fct_restatements
-    description: >
-      Final restatement fact table. Each row represents a detected
-      financial restatement where a metric's value for a given period
-      was changed between filing dates.
-    columns:
-      - name: restatement_id
-        description: Surrogate key for the restatement event
-        tests:
-          - unique
-          - not_null
-      - name: cik
-        tests:
-          - not_null
-      - name: severity
-        description: >
-          Materiality classification based on pct_change and
-          absolute_change thresholds.
-        tests:
-          - not_null
-          - accepted_values:
-              values:
-                - "MATERIAL"
-                - "NOTABLE"
-                - "MINOR"
-      - name: pct_change
-        description: >
-          Percentage change from original to restated value.
-          Null only when original_value was zero.
-      - name: original_value
-        tests:
-          - not_null
-      - name: restated_value
-        tests:
-          - not_null
-      - name: days_to_restatement
-        description: Calendar days between original and restatement filing
-        tests:
-          - not_null
-
-  - name: fct_anomalies
-    description: >
-      Unified anomaly fact table combining restatements and
-      cross-source discrepancies, each scored 0-100.
-    columns:
-      - name: anomaly_id
-        tests:
-          - not_null
-      - name: anomaly_type
-        tests:
-          - not_null
-          - accepted_values:
-              values:
-                - "RESTATEMENT"
-                - "CROSS_SOURCE"
-      - name: cik
-        tests:
-          - not_null
-      - name: severity
-        tests:
-          - not_null
-          - accepted_values:
-              values:
-                - "MATERIAL"
-                - "NOTABLE"
-                - "MINOR"
-      - name: severity_score
-        description: Anomaly severity on a 0-100 scale
-        tests:
-          - not_null
-          # severity_score must be between 0 and 100 inclusive
-          - dbt_utils.accepted_range:
-              min_value: 0
-              max_value: 100
-              inclusive: true
-              config:
-                severity: warn
-                # Falls back to a custom test if dbt_utils is not
-                # installed — see tests/ directory
-
   - name: dim_companies
-    description: >
-      Company dimension. One row per CIK with the latest company name,
-      ticker, and filing activity summary.
+    description: One row per company with filing activity.
     columns:
       - name: cik
-        tests:
-          - unique
-          - not_null
-      - name: company_name
-        tests:
-          - not_null
-      - name: total_filings
-        tests:
-          - not_null
+        tests: [not_null, unique]
 
   - name: dim_filing_periods
-    description: >
-      Reporting period dimension. One row per unique
-      (fiscal_year, fiscal_period) combination.
     columns:
       - name: period_key
-        tests:
-          - unique
-          - not_null
-      - name: fiscal_year
-        tests:
-          - not_null
-      - name: fiscal_period
-        tests:
-          - not_null
-      - name: companies_reporting
+        tests: [not_null, unique]
+
+  - name: fct_restatements
+    description: Detected restatements (value changed between filings) with severity and type.
+    columns:
+      - name: restatement_id
+        tests: [not_null, unique]
+      - name: severity
         tests:
           - not_null
+          - accepted_values:
+              values: ["MATERIAL", "NOTABLE", "MINOR"]
+      - name: restatement_type
+        tests:
+          - accepted_values:
+              values: ["AMENDMENT", "RECAST"]
+      - name: days_to_restatement
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+      - name: cik
+        tests:
+          - relationships:
+              to: ref('dim_companies')
+              field: cik
+
+  - name: fct_anomalies
+    description: All detected issues in one shape. Scored downstream into gold.alerts.
+    columns:
+      - name: anomaly_id
+        tests: [not_null, unique]
+      - name: anomaly_type
+        tests:
+          - accepted_values:
+              values: ["RESTATEMENT", "BALANCE_SHEET_BREAK", "SCALE_ERROR", "VALUATION_OUTLIER"]
+      - name: severity
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["MATERIAL", "NOTABLE", "MINOR"]

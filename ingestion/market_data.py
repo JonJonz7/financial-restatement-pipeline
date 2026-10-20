@@ -14,7 +14,11 @@ logger = logging.getLogger(__name__)
 
 
 def get_market_data(ticker: str, period: str = "5y") -> pd.DataFrame:
-    """Fetch OHLCV + market cap history for a single ticker.
+    """Fetch daily OHLCV history for a single ticker.
+
+    Market cap is deliberately not taken from yfinance: its ``marketCap`` is
+    today's value only, and copying it onto past dates would be wrong. The
+    warehouse derives historical market cap from close x SEC-reported shares.
 
     Args:
         ticker: Stock ticker symbol (e.g. ``"AAPL"``).
@@ -22,7 +26,7 @@ def get_market_data(ticker: str, period: str = "5y") -> pd.DataFrame:
 
     Returns:
         DataFrame with columns: ticker, date, open, high, low, close,
-        volume, market_cap.
+        volume.
     """
     logger.info("Fetching market data for %s (period=%s)", ticker, period)
     stock = yf.Ticker(ticker)
@@ -47,17 +51,8 @@ def get_market_data(ticker: str, period: str = "5y") -> pd.DataFrame:
     # Attempt to get current market cap from info; yfinance history
     # does not provide per-day market cap, so we fill the column with
     # the latest snapshot value (or NaN).
-    try:
-        info = stock.info
-        market_cap = info.get("marketCap")
-    except Exception:
-        market_cap = None
-
     hist["ticker"] = ticker
-    hist["market_cap"] = market_cap
-
-    # Keep only the columns we care about
-    desired = ["ticker", "date", "open", "high", "low", "close", "volume", "market_cap"]
+    desired = ["ticker", "date", "open", "high", "low", "close", "volume"]
     available = [c for c in desired if c in hist.columns]
     hist = hist[available]
 

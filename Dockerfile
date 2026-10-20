@@ -38,11 +38,13 @@ COPY quality/ quality/
 COPY dbt_project/ dbt_project/
 COPY dashboard/ dashboard/
 COPY dags/ dags/
+COPY scripts/ scripts/
+COPY data/sample/ data/sample/
 
 # ---------------------------------------------------------------------------
 # dbt deps (pre-install packages so they're baked into the image)
 # ---------------------------------------------------------------------------
-RUN cd dbt_project && dbt deps --profiles-dir . --project-dir . || true
+RUN cd dbt_project && dbt deps --profiles-dir . --project-dir .
 
 # ---------------------------------------------------------------------------
 # Healthcheck

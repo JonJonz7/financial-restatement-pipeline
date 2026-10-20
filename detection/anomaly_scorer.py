@@ -1,20 +1,23 @@
 """
-Anomaly scoring and alert generation.
+Anomaly prioritisation: turn gold.fct_anomalies into a ranked alert queue.
 
-Takes restatement and cross-source anomaly DataFrames and produces a
-prioritised alert feed with severity scores and recommended actions.
+dbt decides WHAT is an anomaly and how material it is. This module decides
+what a reviewer should look at FIRST, with a transparent points system
+(every point comes with a human-readable reason) and writes gold.alerts plus
+a markdown report.
 """
 
 import logging
 from datetime import date, datetime
+from pathlib import Path
 
+import duckdb
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Metrics that receive higher severity weight because they directly
-# affect investor decisions.
-_HIGH_WEIGHT_METRICS: set[str] = {
+# Metrics investors act on directly get extra weight.
+HIGH_WEIGHT_METRICS: set[str] = {
     "Revenues",
     "RevenueFromContractWithCustomerExcludingAssessedTax",
     "RevenueFromContractWithCustomerIncludingAssessedTax",
@@ -24,163 +27,188 @@ _HIGH_WEIGHT_METRICS: set[str] = {
     "EarningsPerShareDiluted",
     "OperatingIncomeLoss",
     "GrossProfit",
+    "Revenue (quarter)",
 }
 
+# Base points by anomaly type: an internally inconsistent filing is worse
+# than a valuation that merely looks unusual.
+TYPE_POINTS: dict[str, int] = {
+    "RESTATEMENT": 0,
+    "BALANCE_SHEET_BREAK": 25,
+    "SCALE_ERROR": 30,
+    "VALUATION_OUTLIER": 10,
+}
 
-def score_anomaly(row: dict) -> dict:
-    """Score a single restatement or anomaly row.
+ACTIONS = [
+    (70, "IMMEDIATE REVIEW: escalate to compliance; possible material misstatement."),
+    (
+        50,
+        "HIGH PRIORITY: compare the filings side by side and check the company's disclosures.",
+    ),
+    (30, "MONITOR: review in the next cycle; watch for repeats."),
+    (0, "LOW PRIORITY: log and archive."),
+]
 
-    Produces:
-        - severity_score (0-100)
-        - risk_factors: list of human-readable reasons
-        - recommended_action: string
 
-    Args:
-        row: Dict representing one restatement or anomaly record.
+def _as_date(value) -> date | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.date()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
-    Returns:
-        Enriched dict with scoring fields added.
-    """
-    score: float = 0.0
-    risk_factors: list[str] = []
 
-    # --- Factor 1: Magnitude of percentage change ---
-    pct_change = row.get("pct_change")
-    if pct_change is not None:
-        if pct_change > 20:
-            score += 35
-            risk_factors.append(f"Very large percentage change ({pct_change:.1f}%)")
-        elif pct_change > 10:
-            score += 25
-            risk_factors.append(f"Large percentage change ({pct_change:.1f}%)")
-        elif pct_change > 5:
-            score += 18
-            risk_factors.append(f"Material percentage change ({pct_change:.1f}%)")
-        elif pct_change > 1:
-            score += 10
-            risk_factors.append(f"Notable percentage change ({pct_change:.1f}%)")
+def score_anomaly(row: dict, as_of: date | None = None) -> dict:
+    """Score one anomaly 0-100 and explain every point."""
+    as_of = as_of or date.today()
+    score = 0.0
+    reasons: list[str] = []
+
+    kind = row.get("anomaly_type") or "RESTATEMENT"
+    if TYPE_POINTS.get(kind):
+        score += TYPE_POINTS[kind]
+        reasons.append(f"{kind.replace('_', ' ').title()} (+{TYPE_POINTS[kind]})")
+
+    pct = row.get("pct_change")
+    if pct is not None and not pd.isna(pct):
+        pct = abs(float(pct))
+        for limit, pts, label in (
+            (20, 35, "Very large"),
+            (10, 25, "Large"),
+            (5, 18, "Material"),
+            (1, 10, "Notable"),
+        ):
+            if pct > limit:
+                score += pts
+                reasons.append(f"{label} change: {pct:.1f}% (+{pts})")
+                break
         else:
             score += 3
 
-    # --- Factor 2: Absolute dollar magnitude ---
-    absolute_change = row.get("absolute_change", 0)
-    if absolute_change > 1_000_000_000:
-        score += 25
-        risk_factors.append(f"Billion-dollar absolute change (${absolute_change:,.0f})")
-    elif absolute_change > 100_000_000:
-        score += 18
-        risk_factors.append(f"Hundred-million absolute change (${absolute_change:,.0f})")
-    elif absolute_change > 1_000_000:
-        score += 12
-        risk_factors.append(f"Million-dollar absolute change (${absolute_change:,.0f})")
-    elif absolute_change > 100_000:
-        score += 5
+    if (row.get("unit") or "USD") == "USD":
+        amount = abs(float(row.get("absolute_change") or 0) or 0)
+        for limit, pts, label in (
+            (1e9, 25, "Billion-dollar"),
+            (1e8, 18, "Hundred-million"),
+            (1e6, 12, "Million-dollar"),
+            (1e5, 5, "Six-figure"),
+        ):
+            if amount > limit:
+                score += pts
+                reasons.append(f"{label} change: ${amount:,.0f} (+{pts})")
+                break
 
-    # --- Factor 3: Metric importance ---
-    metric = row.get("metric", "")
-    if metric in _HIGH_WEIGHT_METRICS:
+    if row.get("metric") in HIGH_WEIGHT_METRICS:
         score += 15
-        risk_factors.append(f"High-importance metric ({metric})")
+        reasons.append(f"Key metric: {row.get('metric')} (+15)")
 
-    # --- Factor 4: Recency ---
-    restatement_date = row.get("restatement_filing_date") or row.get("filed_date")
-    if restatement_date is not None:
-        try:
-            if isinstance(restatement_date, str):
-                rd = datetime.strptime(restatement_date, "%Y-%m-%d").date()
-            elif isinstance(restatement_date, datetime):
-                rd = restatement_date.date()
-            elif isinstance(restatement_date, date):
-                rd = restatement_date
-            else:
-                rd = None
+    detected = _as_date(row.get("detected_date") or row.get("restatement_filed_date"))
+    if detected is not None:
+        age = (as_of - detected).days
+        if 0 <= age < 90:
+            score += 10
+            reasons.append("Detected in the last 90 days (+10)")
+        elif 0 <= age < 365:
+            score += 5
+            reasons.append("Detected in the last year (+5)")
 
-            if rd is not None:
-                days_ago = (date.today() - rd).days
-                if days_ago < 90:
-                    score += 10
-                    risk_factors.append("Restated within the last 90 days")
-                elif days_ago < 365:
-                    score += 5
-                    risk_factors.append("Restated within the last year")
-        except (ValueError, TypeError):
-            pass
-
-    # --- Factor 5: Severity classification (if already present) ---
-    severity = row.get("severity", "")
-    if severity == "MATERIAL":
+    if row.get("severity") == "MATERIAL":
         score += 10
-        risk_factors.append("Classified as MATERIAL")
+        reasons.append("Classified MATERIAL (+10)")
 
-    # --- Factor 6: Cross-source anomaly z-score ---
-    z_score = row.get("z_score")
-    if z_score is not None:
-        if z_score > 5:
-            score += 20
-            risk_factors.append(f"Extreme cross-source outlier (z={z_score:.1f})")
-        elif z_score > 3:
-            score += 12
-            risk_factors.append(f"Cross-source outlier (z={z_score:.1f})")
-
-    # Clamp to [0, 100].
-    severity_score = int(min(max(score, 0), 100))
-
-    # Determine recommended action.
-    if severity_score >= 70:
-        recommended_action = "IMMEDIATE REVIEW: Escalate to compliance. Possible material misstatement."
-    elif severity_score >= 50:
-        recommended_action = "HIGH PRIORITY: Investigate filing differences and compare to peer group."
-    elif severity_score >= 30:
-        recommended_action = "MONITOR: Flag for next review cycle. Track for repeat occurrences."
-    else:
-        recommended_action = "LOW PRIORITY: Log and archive. No immediate action required."
-
+    priority = int(min(max(round(score), 0), 100))
+    action = next(text for threshold, text in ACTIONS if priority >= threshold)
     return {
         **row,
-        "severity_score": severity_score,
-        "risk_factors": risk_factors,
-        "recommended_action": recommended_action,
+        "priority_score": priority,
+        "risk_factors": reasons,
+        "recommended_action": action,
     }
 
 
-def generate_alerts(
-    restatements: pd.DataFrame,
-    anomalies: pd.DataFrame,
-) -> list[dict]:
-    """Produce a prioritised alert feed from restatements and anomalies.
-
-    Args:
-        restatements: DataFrame from
-            :func:`restatement_detector.detect_restatements`.
-        anomalies: DataFrame from
-            :func:`restatement_detector.detect_cross_source_anomalies`.
-
-    Returns:
-        List of alert dicts sorted by severity_score descending.
-    """
-    alerts: list[dict] = []
-
-    # Score restatements.
-    if restatements is not None and not restatements.empty:
-        for _, row in restatements.iterrows():
-            alert = score_anomaly(row.to_dict())
-            alert["alert_type"] = "RESTATEMENT"
-            alerts.append(alert)
-
-    # Score cross-source anomalies.
-    if anomalies is not None and not anomalies.empty:
-        for _, row in anomalies.iterrows():
-            alert = score_anomaly(row.to_dict())
-            alert["alert_type"] = "CROSS_SOURCE_ANOMALY"
-            alerts.append(alert)
-
-    # Sort by severity (highest first).
-    alerts.sort(key=lambda a: a.get("severity_score", 0), reverse=True)
-
-    logger.info(
-        "Generated %d alerts (%d restatement, %d cross-source)",
-        len(alerts),
-        sum(1 for a in alerts if a["alert_type"] == "RESTATEMENT"),
-        sum(1 for a in alerts if a["alert_type"] == "CROSS_SOURCE_ANOMALY"),
+def score_anomalies(anomalies: pd.DataFrame, as_of: date | None = None) -> pd.DataFrame:
+    """Score every row; highest priority first."""
+    if anomalies is None or anomalies.empty:
+        return pd.DataFrame(
+            columns=["priority_score", "risk_factors", "recommended_action"]
+        )
+    scored = [score_anomaly(r, as_of) for r in anomalies.to_dict("records")]
+    return pd.DataFrame(scored).sort_values(
+        "priority_score", ascending=False, ignore_index=True
     )
+
+
+def generate_alerts(
+    restatements: pd.DataFrame, anomalies: pd.DataFrame, as_of: date | None = None
+) -> list[dict]:
+    """Backwards-compatible: score two frames together, return a list of dicts."""
+    frames = [f for f in (restatements, anomalies) if f is not None and not f.empty]
+    if not frames:
+        return []
+    return score_anomalies(pd.concat(frames, ignore_index=True), as_of).to_dict(
+        "records"
+    )
+
+
+def write_alerts(
+    db_path: str, report_path: Path | None = None, as_of: date | None = None
+) -> pd.DataFrame:
+    """Score gold.fct_anomalies into gold.alerts and an optional markdown report."""
+    from detection.restatement_detector import all_anomalies
+
+    alerts = score_anomalies(all_anomalies(db_path), as_of)
+    if not alerts.empty:
+        alerts["risk_factors"] = alerts["risk_factors"].map(" | ".join)
+    con = duckdb.connect(db_path)
+    try:
+        con.execute("CREATE SCHEMA IF NOT EXISTS gold")
+        con.register("_alerts", alerts)
+        con.execute("CREATE OR REPLACE TABLE gold.alerts AS SELECT * FROM _alerts")
+        con.unregister("_alerts")
+    finally:
+        con.close()
+    if report_path is not None:
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(report_path).write_text(render_report(alerts, as_of or date.today()))
+    logger.info("Wrote %d alerts to gold.alerts", len(alerts))
     return alerts
+
+
+def render_report(alerts: pd.DataFrame, as_of: date) -> str:
+    lines = [f"# Alert report ({as_of.isoformat()})", ""]
+    if alerts.empty:
+        return "\n".join(lines + ["No anomalies detected."]) + "\n"
+    counts = alerts["anomaly_type"].value_counts().to_dict()
+    lines += [
+        f"{len(alerts)} alerts: " + ", ".join(f"{v} {k}" for k, v in counts.items()),
+        "",
+        "| Priority | Company | Type | Metric | Period end | Reported | Expected / prior | Change | Action |",
+        "|---:|---|---|---|---|---:|---:|---:|---|",
+    ]
+    for r in alerts.to_dict("records"):
+
+        def money(v):
+            return "" if v is None or pd.isna(v) else f"{v:,.0f}"
+
+        pct = r.get("pct_change")
+        lines.append(
+            f"| {r['priority_score']} | {r.get('ticker') or r['cik']} | {r['anomaly_type']} | "
+            f"{r['metric']} | {str(r['period_end'])[:10]} | {money(r.get('actual_value'))} | "
+            f"{money(r.get('expected_value'))} | "
+            f"{'' if pct is None or pd.isna(pct) else f'{pct:+.2f}%'} | "
+            f"{r['recommended_action'].split(':')[0]} |"
+        )
+    lines += ["", "Why each alert scored what it did:", ""]
+    for r in alerts.to_dict("records"):
+        lines.append(
+            f"- **{r.get('ticker') or r['cik']} {r['metric']} {str(r['period_end'])[:10]}** "
+            f"({r['priority_score']}): {r['risk_factors']}"
+        )
+    return "\n".join(lines) + "\n"

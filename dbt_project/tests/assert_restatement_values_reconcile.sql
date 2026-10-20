@@ -1,86 +1,25 @@
 /*
-    Singular test: assert_restatement_values_reconcile
-    ---------------------------------------------------------------
-    Verifies that every restatement in fct_restatements traces back
-    to actual different values in the staging layer.
-
-    This test catches cases where:
-      - A restatement was fabricated by a transformation bug
-      - The original_value or restated_value don't match what's
-        in stg_financial_facts
-      - A join error created phantom restatements
-
-    The query returns rows that FAIL reconciliation.
-    A passing test returns 0 rows.
+    Every restatement must tie back to two real facts in staging: the
+    original and the restated value, at the same full grain, and the two
+    must differ. Returns offending rows (a passing test returns none).
 */
+with r as (select * from {{ ref('fct_restatements') }}),
+f as (select * from {{ ref('stg_financial_facts') }})
 
-with restatements as (
-
-    select
-        cik,
-        metric,
-        period_end,
-        original_value,
-        restated_value,
-        original_filed_date,
-        restatement_filed_date
-    from {{ ref('fct_restatements') }}
-
-),
-
--- Look up the original value in staging
-original_facts as (
-
-    select
-        cik,
-        metric,
-        period_end,
-        filed_date,
-        value
-    from {{ ref('stg_financial_facts') }}
-
-),
-
-reconciled as (
-
-    select
-        r.cik,
-        r.metric,
-        r.period_end,
-        r.original_value,
-        r.restated_value,
-        r.original_filed_date,
-        r.restatement_filed_date,
-
-        orig.value  as staging_original_value,
-        rest.value  as staging_restated_value
-
-    from restatements r
-
-    -- Join to find the original value in staging
-    left join original_facts orig
-        on  r.cik               = orig.cik
-        and r.metric            = orig.metric
-        and r.period_end        = orig.period_end
-        and r.original_filed_date = orig.filed_date
-
-    -- Join to find the restated value in staging
-    left join original_facts rest
-        on  r.cik               = rest.cik
-        and r.metric            = rest.metric
-        and r.period_end        = rest.period_end
-        and r.restatement_filed_date = rest.filed_date
-
-)
-
--- Return rows where the restatement does NOT reconcile with staging
-select *
-from reconciled
-where
-    -- Original value doesn't match staging
-    staging_original_value is null
-    or staging_restated_value is null
-    or abs(original_value - staging_original_value) > 0.01
-    or abs(restated_value - staging_restated_value) > 0.01
-    -- Values should actually differ
-    or abs(original_value - restated_value) < 0.01
+select r.restatement_id
+from r
+left join f orig
+  on orig.cik = r.cik and orig.taxonomy = r.taxonomy and orig.metric = r.metric
+ and orig.unit = r.unit and orig.period_end = r.period_end
+ and orig.period_start is not distinct from r.period_start
+ and orig.accession_number = r.original_accession_number
+left join f rest
+  on rest.cik = r.cik and rest.taxonomy = r.taxonomy and rest.metric = r.metric
+ and rest.unit = r.unit and rest.period_end = r.period_end
+ and rest.period_start is not distinct from r.period_start
+ and rest.accession_number = r.restatement_accession_number
+where orig.value is null
+   or rest.value is null
+   or abs(orig.value - r.original_value) > 0.01
+   or abs(rest.value - r.restated_value) > 0.01
+   or abs(r.original_value - r.restated_value) < 0.01

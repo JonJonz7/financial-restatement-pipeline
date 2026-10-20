@@ -4,7 +4,7 @@ financial_restatement:
   outputs:
     dev:
       type: duckdb
-      path: ../warehouse.duckdb
+      path: "{{ env_var('WAREHOUSE_DB_PATH', '../warehouse.duckdb') }}"
       threads: 4
 
     # -----------------------------------------------------------------

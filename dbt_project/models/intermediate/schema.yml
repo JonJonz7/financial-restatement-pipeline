@@ -2,62 +2,33 @@ version: 2
 
 models:
   - name: int_filing_comparisons
-    description: >
-      Detects financial restatements by comparing successive filings
-      for the same (cik, metric, period_end). Each row represents a
-      case where a metric's reported value changed between filings.
+    description: Every change of a fact's value between consecutive filings.
     columns:
-      - name: cik
-        tests:
-          - not_null
-      - name: metric
-        tests:
-          - not_null
-      - name: period_end
-        tests:
-          - not_null
-      - name: original_value
-        tests:
-          - not_null
       - name: restated_value
-        tests:
-          - not_null
-      - name: original_filed_date
-        tests:
-          - not_null
-      - name: restatement_filed_date
-        tests:
-          - not_null
-      - name: absolute_change
-        description: restated_value minus original_value
-        tests:
-          - not_null
-      - name: pct_change
-        description: >
-          Percentage change from original to restated value.
-          Null only when original_value is zero.
+        tests: [not_null]
+      - name: original_value
+        tests: [not_null]
 
-  - name: int_cross_source_validation
-    description: >
-      Flags discrepancies between SEC-reported financial figures and
-      market data. Only rows with FLAGGED or UNKNOWN status are kept.
+  - name: int_balance_sheet_checks
+    description: Filings where Assets does not equal Liabilities + Equity.
+
+  - name: int_quarterly_revenue
+    description: One revenue figure per company-quarter (latest version; Q4 derived when untagged).
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [cik, period_end]
+
+  - name: int_scale_checks
+    description: Quarters whose revenue is under 5% or over 20x the company's median quarter.
+
+  - name: int_market_valuation
+    description: Market cap and price-to-sales per company-quarter with a robust z-score.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [cik, period_end]
     columns:
-      - name: cik
+      - name: market_cap
         tests:
-          - not_null
-      - name: ticker
-        tests:
-          - not_null
-      - name: metric
-        tests:
-          - not_null
-      - name: discrepancy_flag
-        tests:
-          - not_null
-          - accepted_values:
-              values:
-                - "FLAGGED"
-                - "UNKNOWN"
-      - name: reported_value
-        tests:
-          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false

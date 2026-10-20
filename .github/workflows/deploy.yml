@@ -1,166 +1,66 @@
 ###############################################################################
-# CD — Financial Restatement Pipeline
-# --------------------------------------------------------------------------
-# Deploys infrastructure via Terraform and Cloud Functions to GCP.
-# Triggered on push to main after CI passes.
-# Uses Workload Identity Federation (OIDC) — no long-lived service account
-# keys stored in GitHub.
+# Deploy (manual only): Terraform plan/apply for the GCP design in terraform/.
+#
+# Status: NOT deployed. This project runs locally on DuckDB. The workflow is
+# kept so the deployment path is real and reviewable: it refuses to run until
+# the GCP secrets exist, and apply needs a human approval on the "production"
+# environment. See docs/ROADMAP.md for what is still missing (the Cloud
+# Function entry point and a BigQuery dbt target).
 ###############################################################################
-
 name: Deploy
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      apply:
+        description: "Apply the plan (otherwise plan only)"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write   # OIDC to GCP: no long-lived keys stored in GitHub
+  contents: read
 
 concurrency:
   group: deploy-production
   cancel-in-progress: false
 
-env:
-  TF_VERSION: "1.7.0"
-  PYTHON_VERSION: "3.11"
-  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  GCP_REGION: "us-east4"
-  WORKLOAD_IDENTITY_PROVIDER: ${{ secrets.WIF_PROVIDER }}
-  SERVICE_ACCOUNT: ${{ secrets.GCP_SA_EMAIL }}
-
-permissions:
-  id-token: write   # Required for OIDC
-  contents: read
-
 jobs:
-  # -------------------------------------------------------------------------
-  # Terraform Plan
-  # -------------------------------------------------------------------------
-  terraform-plan:
-    name: Terraform Plan
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require GCP configuration
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          WIF_PROVIDER: ${{ secrets.WIF_PROVIDER }}
+          GCP_SA_EMAIL: ${{ secrets.GCP_SA_EMAIL }}
+        run: |
+          missing=""
+          for v in GCP_PROJECT_ID WIF_PROVIDER GCP_SA_EMAIL; do
+            [ -z "${!v}" ] && missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing. Nothing to deploy to."
+            exit 1
+          fi
+
+  terraform:
+    needs: preflight
     runs-on: ubuntu-latest
     environment: production
     defaults:
       run:
         working-directory: terraform
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Authenticate to GCP (OIDC)
-        uses: google-github-actions/auth@v2
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ env.SERVICE_ACCOUNT }}
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+      - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Terraform Init
-        run: terraform init
-
-      - name: Terraform Validate
-        run: terraform validate
-
-      - name: Terraform Plan
-        run: |
-          terraform plan \
-            -var="project_id=${{ env.GCP_PROJECT_ID }}" \
-            -out=tfplan \
-            -input=false
-
-      - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: tfplan
-          path: terraform/tfplan
-
-  # -------------------------------------------------------------------------
-  # Terraform Apply (manual approval gate via GitHub Environment)
-  # -------------------------------------------------------------------------
-  terraform-apply:
-    name: Terraform Apply
-    runs-on: ubuntu-latest
-    needs: terraform-plan
-    environment:
-      name: production
-      url: https://console.cloud.google.com/bigquery?project=${{ env.GCP_PROJECT_ID }}
-    defaults:
-      run:
-        working-directory: terraform
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Authenticate to GCP (OIDC)
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ env.SERVICE_ACCOUNT }}
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Download plan artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: tfplan
-          path: terraform/
-
-      - name: Terraform Init
-        run: terraform init
-
-      - name: Terraform Apply
+          terraform_version: "1.7.0"
+      - run: terraform init
+      - run: terraform plan -var="project_id=${{ secrets.GCP_PROJECT_ID }}" -out=tfplan
+      - if: ${{ inputs.apply }}
         run: terraform apply -auto-approve tfplan
-
-  # -------------------------------------------------------------------------
-  # Deploy Cloud Function
-  # -------------------------------------------------------------------------
-  deploy-functions:
-    name: Deploy Cloud Functions
-    runs-on: ubuntu-latest
-    needs: terraform-apply
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Authenticate to GCP (OIDC)
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ env.SERVICE_ACCOUNT }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.GCP_PROJECT_ID }}
-
-      - name: Package Cloud Function
-        run: |
-          mkdir -p dist
-          cd ingestion && zip -r ../dist/edgar-ingestion.zip . -x '__pycache__/*' '*.pyc'
-
-      - name: Deploy EDGAR ingestion function
-        run: |
-          gcloud functions deploy edgar-ingestion \
-            --gen2 \
-            --region=${{ env.GCP_REGION }} \
-            --runtime=python311 \
-            --entry-point=ingest_handler \
-            --source=dist/edgar-ingestion.zip \
-            --trigger-http \
-            --memory=512Mi \
-            --timeout=540s \
-            --service-account=${{ env.SERVICE_ACCOUNT }} \
-            --set-env-vars="GCP_PROJECT=${{ env.GCP_PROJECT_ID }}" \
-            --no-allow-unauthenticated

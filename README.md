@@ -1,242 +1,112 @@
 # Financial Restatement & Anomaly Detection Pipeline
 
-A production-grade data engineering pipeline that ingests SEC EDGAR filings, detects financial restatements, and scores anomalies for prioritized review. Financial institutions lose billions annually to undetected data discrepancies, and SEC/FINRA regulatory pressure is accelerating -- particularly after the T+1 settlement shift. This pipeline automates what most firms still do manually: continuously monitoring for restated financial values and flagging material changes before they cascade into downstream systems.
+A self-directed data engineering project. It ingests public company filings from **SEC EDGAR** (XBRL "company facts"), lands the raw files, loads a **DuckDB** warehouse in bronze/silver/gold layers, transforms and tests it with **dbt**, gates it with **data contracts** and **Great Expectations**, and produces a ranked queue of things a financial analyst should review:
+
+| Detected | What it means |
+|---|---|
+| **Restatement (amendment)** | A company filed a 10-K/A or 10-Q/A that changed a number it had already reported |
+| **Restatement (recast)** | A later regular report shows a different value for an old period |
+| **Balance-sheet break** | Assets ≠ Liabilities + Stockholders' Equity inside one filing |
+| **Scale error** | A quarter's revenue is <5% or >20× the company's usual quarter (e.g. tagged in thousands) |
+| **Valuation outlier** | Price-to-sales far outside the company's own history (robust z-score) |
+
+It runs on your laptop (`make demo` needs no network or accounts). A Google Cloud deployment is **designed** in Terraform and validated in CI, but **not deployed**. See [Limitations](#limitations).
+
+## Results on the bundled sample data
+
+`data/sample/` holds three **fictional** companies in the exact JSON shape EDGAR returns, with one planted case per rule. CI runs the whole pipeline on it on every push. Output ([`reports/demo_alerts.md`](reports/demo_alerts.md)):
+
+| Priority | Company | Type | Metric | Period | Change | Action |
+|---:|---|---|---|---|---:|---|
+| 100 | CDRH | SCALE_ERROR | Revenue (quarter) | 2022-09-30 | −99.90% | Immediate review |
+| 57 | HRBL | BALANCE_SHEET_BREAK | Assets | 2023-12-31 | +2.33% | High priority |
+| 55 | NWDV | RESTATEMENT (10-K/A) | NetIncomeLoss | 2023-12-31 | −6.00% | High priority |
+| 55 | NWDV | RESTATEMENT (10-K/A) | Revenues | 2023-12-31 | −6.00% | High priority |
+| 40 | HRBL | RESTATEMENT (recast) | Revenues | 2022-12-31 | −0.50% | Monitor |
+| … | | | | | | |
+
+All planted cases are found and nothing else is: a quarter and a full year that end on the same day are correctly *not* compared (a real bug in v1 of this project; see [docs/LESSONS_FROM_V1.md](docs/LESSONS_FROM_V1.md)).
 
 ## Architecture
 
-```
-                                +------------------+
-                                |   SEC EDGAR API  |
-                                +--------+---------+
-                                         |
-                    +--------------------v--------------------+
-                    |          Ingestion Layer (Python)        |
-                    |   edgar_client.py  |  market_data.py     |
-                    +--------------------+--------------------+
-                                         |
-                    +--------------------v--------------------+
-                    |         Bronze (DuckDB - Raw)           |
-                    |  raw_filings | raw_financial_facts |     |
-                    |  raw_market_data                         |
-                    +--------------------+--------------------+
-                                         |
-                    +--------------------v--------------------+
-                    |         dbt Transformation               |
-                    |  Staging -> Intermediate -> Marts        |
-                    +--------------------+--------------------+
-                                         |
-               +-------------------------+-------------------------+
-               |                         |                         |
-   +-----------v-----------+ +-----------v-----------+ +-----------v-----------+
-   |   Silver (Cleaned)    | |    Gold (Analytics)    | |   Detection Engine    |
-   |  stg_filings          | |  fct_restatements      | |  restatement_detector |
-   |  stg_financial_facts  | |  fct_anomalies         | |  anomaly_scorer       |
-   |  stg_market_data      | |  dim_companies         | |                       |
-   +-----------------------+ +----------+-----------+ +-----------+------------+
-                                         |                         |
-                                         +-----------+-------------+
-                                                     |
-                                         +-----------v-----------+
-                                         |  Streamlit Dashboard   |
-                                         |  Alerts & Monitoring   |
-                                         +-----------------------+
-
-   +------------------+    +---------------------+    +------------------+
-   | Airflow          |    | Great Expectations   |    | Terraform IaC    |
-   | Orchestration    |    | Quality Gates        |    | GCP Deployment   |
-   +------------------+    +---------------------+    +------------------+
+```mermaid
+flowchart LR
+  EDGAR[SEC EDGAR API<br/>submissions + companyfacts] --> ING[ingestion/<br/>rate-limited client]
+  YF[Yahoo Finance<br/>daily prices] --> ING
+  ING --> LAND[(landing zone<br/>raw JSON.gz + SHA-256)]
+  LAND --> BRONZE[(bronze<br/>raw tables + lineage)]
+  BRONZE --> QG{quality gates<br/>contracts + GE}
+  QG -->|pass| DBT[dbt build<br/>staging → intermediate → marts<br/>+ 45 tests]
+  DBT --> GOLD[(gold<br/>fct_restatements<br/>fct_anomalies)]
+  GOLD --> SCORE[detection/<br/>priority scoring]
+  SCORE --> ALERTS[(gold.alerts<br/>+ markdown report)]
+  ALERTS --> DASH[Streamlit dashboard]
+  AF[Airflow DAG] -.orchestrates.-> ING & QG & DBT & SCORE
 ```
 
-## The Problem
+| Layer | Tables | Built by |
+|---|---|---|
+| landing | `data/landing/<source>/<cik>/<date>.json.gz` | `ingestion/landing.py` |
+| bronze | `raw_companies`, `raw_filings`, `raw_financial_facts`, `raw_market_data`, `ingestion_runs` | `ingestion/loader.py` |
+| silver | `stg_*` views; `int_filing_comparisons`, `int_balance_sheet_checks`, `int_quarterly_revenue`, `int_scale_checks`, `int_market_valuation` | dbt |
+| gold | `dim_companies`, `dim_filing_periods`, `fct_restatements`, `fct_anomalies`, `alerts` | dbt + `detection/` |
 
-Financial data reconciliation is one of the most resource-intensive operations in capital markets and corporate finance. When a public company restates previously reported figures -- changing revenue, net income, or asset totals in an amended filing -- every downstream consumer of that data is affected: risk models, compliance reports, trading algorithms, and investor disclosures. The industry spends an estimated $2-5 billion annually on manual reconciliation processes that still miss critical changes.
+Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · column-level meaning: [docs/DATA_DICTIONARY.md](docs/DATA_DICTIONARY.md)
 
-The SEC's shift to T+1 settlement (effective May 2024) compressed the window for catching data errors from two business days to one. At the same time, SEC and FINRA enforcement actions related to data accuracy have increased year over year. Firms that relied on periodic manual reviews are now exposed: a restated 10-K filed on a Friday afternoon can propagate incorrect values through an entire analytics stack before anyone notices on Monday.
+## Quick start
 
-This pipeline addresses the gap by continuously ingesting SEC EDGAR filings, comparing values across filing dates for the same reporting period, and automatically flagging restatements with severity classification and recommended actions. Instead of discovering a material restatement during quarterly audit, the system surfaces it within hours of the amended filing hitting EDGAR.
+```bash
+make setup        # Python 3.11 venv, dependencies, dbt packages
+make demo         # sample data → contracts → GE → dbt build → alerts (no network)
+WAREHOUSE_DB_PATH=$PWD/demo.duckdb make dashboard   # http://localhost:8501
+make test         # 29 unit + integration tests (includes a real dbt build)
+```
+
+Live data from SEC EDGAR (free, no API key, but SEC requires you to identify yourself):
+
+```bash
+cp .env.example .env            # set EDGAR_USER_AGENT="Your Name you@yourdomain.com"
+make pipeline                   # ingest → quality → transform → detect
+cat reports/alerts.md
+```
+
+`make help` lists every command. Each one is a plain `python -m ...` or `dbt` call you can run on its own.
+
+## Quality: four layers
+
+1. **Data contracts** (`quality/data_contracts/*.yml`, run by `quality/check_contracts.py`): schema, nullability, uniqueness, patterns, row rules, volume and freshness on bronze. Error-level breaches exit non-zero and stop the pipeline *before* dbt.
+2. **Great Expectations** (`quality/run_expectations.py`): statistical expectations with `mostly` tolerances.
+3. **dbt tests**: 45 schema and singular tests, including that every restatement reconciles to two real facts and a regression test for the quarter-vs-year bug.
+4. **pytest**: unit tests for parsing, loading, scoring and contracts, plus an end-to-end test that builds the real dbt project on sample data and asserts exactly what is found.
+
+## How this was built
+
+[docs/BUILD_GUIDE.md](docs/BUILD_GUIDE.md) walks through building this project from an empty folder, phase by phase, with the commands, the reasoning and the checks at each step. It's written so someone else could rebuild it, and so I can explain every decision.
+
+Also in `docs/`: [RUNBOOK.md](docs/RUNBOOK.md) (operating it, and fixing it when it breaks), [LESSONS_FROM_V1.md](docs/LESSONS_FROM_V1.md) (bugs that only real data exposed) and [ROADMAP.md](docs/ROADMAP.md).
+
+## Project layout
+
+```
+ingestion/        EDGAR client, landing zone, bronze loader, orchestrator CLI, sample loader
+quality/          data contracts + checker, Great Expectations suite + runner
+dbt_project/      staging / intermediate / marts models, seeds, macros, tests
+detection/        severity thresholds (shared with dbt), priority scoring, alert report
+dashboard/        Streamlit app (read-only)
+dags/             Airflow DAG (same commands as the Makefile)
+terraform/        GCP design: GCS, BigQuery datasets, Cloud Function, Scheduler, IAM
+scripts/          sample-data generator
+data/sample/      fictional EDGAR-shaped companies used by CI and `make demo`
+docs/             build guide, architecture, data dictionary, runbook, lessons, roadmap
+```
+
+## Limitations
+
+- **"Restatement" here means "value changed between filings".** Recasts include legitimate reclassifications (e.g. discontinued operations). The pipeline flags them for review; it doesn't judge intent.
+- **Market data** comes from Yahoo Finance via `yfinance`, an unofficial API. Historical market cap is derived as close price × SEC-reported shares outstanding.
+- **Not deployed to the cloud.** The Terraform is validated in CI but has never been applied; the Cloud Function handler and a BigQuery dbt target aren't written yet ([ROADMAP](docs/ROADMAP.md)).
+- **Sample companies are fictional.** Live runs use real public filings.
 
 ## Stack
 
-| Tool | Purpose |
-|---|---|
-| **DuckDB** | Analytical warehouse (local dev). Columnar, zero-config, fast OLAP queries on financial data. |
-| **dbt** | SQL transformation framework. Manages the bronze-to-gold medallion pipeline with tests and documentation. |
-| **Apache Airflow** | Workflow orchestration. Schedules daily EDGAR ingestion, dbt runs, quality gates, and detection. |
-| **Great Expectations** | Statistical data quality validation. Enforces expectations on freshness, completeness, and value ranges. |
-| **Terraform** | Infrastructure as code. Defines the GCP production deployment (BigQuery, Cloud Functions, Cloud Scheduler). |
-| **Docker** | Containerization. Single image for pipeline CLI, dbt, and dashboard. Docker Compose for local dev stack. |
-| **GitHub Actions** | CI/CD. Runs pytest, dbt tests, linting, GE checkpoints, and security scans on every push. |
-| **Streamlit + Plotly** | Interactive monitoring dashboard. KPIs, restatement timeline, severity distribution, company deep dives. |
-| **Python (requests, pandas)** | SEC EDGAR API client and data manipulation. Rate-limited, with structured error handling. |
-| **yfinance** | Market data for cross-source validation (OHLCV, market cap vs. SEC-reported figures). |
-
-## Data Model
-
-The pipeline uses a **medallion architecture** with three layers:
-
-**Bronze (Raw)** -- Landing zone for unmodified API responses.
-- `bronze.raw_filings` -- SEC filing metadata (CIK, accession number, form type, dates)
-- `bronze.raw_financial_facts` -- XBRL financial facts (metric, value, period, filing date)
-- `bronze.raw_market_data` -- OHLCV price history and market capitalization
-
-**Silver (Cleaned)** -- Deduplicated, type-cast, business-key enriched.
-- `silver.stg_filings` -- Cleaned filing metadata with surrogate keys
-- `silver.stg_financial_facts` -- Filtered facts (nulls removed) with deterministic fact keys
-- `silver.stg_market_data` -- Normalized market data
-
-**Gold (Analytics)** -- Business-ready aggregates and detection outputs.
-- `gold.fct_restatements` -- Detected restatements with severity classification and days-to-detection
-- `gold.fct_anomalies` -- Unified anomaly table (restatements + cross-source) with severity scores (0-100)
-- `gold.dim_companies` -- Company dimension with filing activity summary
-- `gold.dim_filing_periods` -- Fiscal period dimension for time-series analysis
-
-## Key Features
-
-- **Real SEC EDGAR data** -- Ingests from the official XBRL companyfacts and submissions API endpoints for 20 major public companies (AAPL, MSFT, GOOGL, AMZN, JPM, GS, etc.)
-- **Automated restatement detection** -- Identifies cases where the same (company, metric, period) was filed with different values across filing dates
-- **Severity classification** -- MATERIAL (>5% or >$1M change), NOTABLE (1-5%), MINOR (<1%) with corresponding recommended actions
-- **Cross-source validation** -- Compares SEC-reported revenue and assets against market capitalization to flag statistical outliers (>3 standard deviations)
-- **Anomaly scoring (0-100)** -- Six-factor scoring model: percentage change magnitude, absolute dollar magnitude, metric importance, recency, severity classification, and cross-source z-score
-- **Data quality contracts** -- Schema-level data contracts with freshness SLAs, completeness thresholds, and validity rules
-- **Three layers of quality gates** -- dbt tests (schema + singular), Great Expectations (statistical), data contracts (SLA + ownership)
-- **Full CI/CD** -- GitHub Actions pipeline with pytest, dbt test, ruff linting, format checks, and dependency security scans
-- **Infrastructure as Code** -- Terraform configs for GCP production deployment (BigQuery + Cloud Functions + Cloud Scheduler)
-- **Containerized** -- Docker image and docker-compose for local development with Airflow, DuckDB, and Streamlit
-
-## Quick Start
-
-```bash
-make setup      # Create venv, install deps, init DuckDB, install dbt packages
-make ingest     # Pull real SEC EDGAR data for 20 companies
-make transform  # Run dbt models (staging -> intermediate -> marts)
-make detect     # Find restatements and score anomalies
-make dashboard  # Launch Streamlit dashboard on localhost:8501
-```
-
-Or run everything at once:
-
-```bash
-make pipeline   # ingest + transform + detect
-```
-
-For the full Docker stack (Airflow + Dashboard):
-
-```bash
-make docker-up  # Airflow UI at localhost:8080, Dashboard at localhost:8501
-```
-
-## Project Structure
-
-```
-financial-restatement-pipeline/
-|-- ingestion/
-|   |-- edgar_client.py          # SEC EDGAR API client (rate-limited, XBRL parsing)
-|   |-- loader.py                # DuckDB warehouse loader (upsert semantics)
-|   |-- market_data.py           # Yahoo Finance market data client
-|   |-- pipeline.py              # End-to-end ingestion + detection orchestrator
-|   |-- config.py                # Watched companies, API settings, rate limits
-|
-|-- detection/
-|   |-- restatement_detector.py  # Core restatement detection (SQL-based)
-|   |-- anomaly_scorer.py        # Six-factor severity scoring and alert generation
-|
-|-- dbt_project/
-|   |-- models/
-|   |   |-- staging/             # stg_filings, stg_financial_facts, stg_market_data
-|   |   |-- intermediate/        # int_filing_comparisons, int_cross_source_validation
-|   |   |-- marts/               # fct_restatements, fct_anomalies, dim_companies, dim_filing_periods
-|   |-- tests/                   # Singular dbt tests (orphan checks, value reconciliation, score ranges)
-|   |-- macros/                  # materiality_threshold, surrogate_key
-|   |-- seeds/                   # materiality_thresholds.csv
-|
-|-- dashboard/
-|   |-- app.py                   # Streamlit dashboard (KPIs, timeline, severity, deep dives)
-|
-|-- dags/
-|   |-- filing_pipeline_dag.py   # Airflow DAG (ingestion -> dbt -> GE -> detection -> alerts)
-|
-|-- tests/
-|   |-- conftest.py              # Shared fixtures (sample XBRL, test DB, financial records)
-|   |-- test_edgar_client.py     # EDGAR client tests (mocked HTTP, rate limiting, parsing)
-|   |-- test_restatement_detector.py  # Detection tests (real DuckDB, severity classification)
-|   |-- test_anomaly_scorer.py   # Scoring tests (score ranges, sorting, risk factors)
-|   |-- test_loader.py           # Loader tests (schema creation, upserts, deduplication)
-|
-|-- quality/
-|   |-- great_expectations/      # GE config, expectations, checkpoints
-|   |-- data_contracts/          # Schema-level data contracts with SLAs
-|
-|-- terraform/                   # GCP IaC (BigQuery, Cloud Functions, Cloud Scheduler)
-|-- .github/workflows/           # CI (pytest + dbt + lint + security) and CD (deploy)
-|-- Dockerfile                   # Multi-purpose container image
-|-- docker-compose.yml           # Local dev stack (Airflow + DuckDB + Streamlit)
-|-- Makefile                     # Developer commands (setup, ingest, transform, detect, test)
-|-- requirements.txt             # Python dependencies
-```
-
-## Data Quality
-
-Quality enforcement operates at three levels:
-
-**1. dbt Tests (Schema + Singular)**
-Schema tests validate not-null constraints, accepted values, uniqueness, and referential integrity across every model. Singular tests enforce business rules: no orphaned anomalies (every anomaly references a valid restatement or cross-source record), restatement values reconcile correctly (restated minus original equals absolute change), and severity scores fall within the valid 0-100 range.
-
-**2. Great Expectations (Statistical)**
-The GE checkpoint runs against the bronze layer after every ingestion cycle. Expectations validate column-level statistics: row counts above minimum thresholds, value distributions within expected ranges, date columns conforming to expected formats, and no unexpected nulls in required fields.
-
-**3. Data Contracts (SLA + Ownership)**
-YAML-based contracts define the schema, quality rules, freshness SLAs, and ownership for each bronze table. The `raw_financial_facts` contract specifies a 24-hour freshness requirement (measured on `ingested_at`), 95% completeness threshold, and acceptable form types. Contracts serve as the single source of truth between producers (ingestion) and consumers (dbt models, detection engine).
-
-## Cloud Deployment
-
-The `terraform/` directory contains production-ready IaC for Google Cloud Platform:
-
-- **BigQuery** -- Three datasets (`bronze`, `silver`, `gold`) mirroring the local DuckDB medallion architecture. Production dbt models target BigQuery instead of DuckDB via profile switching.
-- **Cloud Functions** -- A Python 3.11 function (`edgar-ingestion`) handles EDGAR API calls with 512MB memory and 9-minute timeout. Triggered by Cloud Scheduler or on-demand HTTP POST.
-- **Cloud Scheduler** -- Daily trigger at 06:00 ET with retry policy (3 attempts, 30-300s backoff). Uses OIDC authentication against the pipeline service account.
-- **GCS** -- Versioned bucket for raw filing archive with automatic NEARLINE tiering after 365 days.
-- **IAM** -- Least-privilege bindings: the pipeline service account gets BigQuery User/DataEditor, Cloud Functions Invoker, Cloud Scheduler Admin, and GCS ObjectAdmin.
-
-## Sample Output
-
-A detected restatement looks like this:
-
-| cik | metric | period_end | original_value | restated_value | pct_change | severity | days_to_detect |
-|---|---|---|---|---|---|---|---|
-| 0000320193 | Revenues | 2023-09-30 | 383,285,000,000 | 390,000,000,000 | 1.75% | NOTABLE | 104 |
-| 0000789019 | NetIncomeLoss | 2023-06-30 | 72,361,000,000 | 74,100,000,000 | 2.40% | NOTABLE | 87 |
-| 0000886982 | Assets | 2023-12-31 | 1,641,594,000,000 | 1,572,000,000,000 | 4.24% | NOTABLE | 62 |
-
-An anomaly alert includes a severity score (0-100), risk factors, and recommended action:
-
-```
-Severity Score: 85
-Risk Factors:
-  - Large percentage change (12.3%)
-  - Billion-dollar absolute change ($47,200,000,000)
-  - High-importance metric (Revenues)
-  - Restated within the last 90 days
-  - Classified as MATERIAL
-Recommended Action: IMMEDIATE REVIEW - Escalate to compliance. Possible material misstatement.
-```
-
-## Testing
-
-Run the full test suite:
-
-```bash
-make test       # pytest + dbt test
-```
-
-Or run pytest alone:
-
-```bash
-pytest tests/ -v --tb=short
-```
-
-**Coverage:**
-- `test_edgar_client.py` -- EDGAR API client (mocked HTTP calls, XBRL parsing, rate limiting, User-Agent header, form-type filtering, CIK normalization)
-- `test_restatement_detector.py` -- Restatement detection (real DuckDB, value change detection, identical-value exclusion, severity classification for MATERIAL/NOTABLE/MINOR, empty database handling)
-- `test_anomaly_scorer.py` -- Anomaly scoring (score range validation, high/low severity thresholds, alert sorting, risk factor generation, recommended actions, edge cases with null/zero values)
-- `test_loader.py` -- Warehouse loader (schema creation, table creation, insert correctness, upsert deduplication, empty input handling)
-- dbt tests -- Schema constraints, orphan anomaly checks, value reconciliation, score range assertions
+Python 3.11 · DuckDB · dbt-core + dbt-duckdb · Great Expectations · Airflow · Streamlit + Plotly · Terraform (GCP) · Docker · GitHub Actions

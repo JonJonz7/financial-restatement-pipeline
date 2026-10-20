@@ -1,147 +1,64 @@
 # =============================================================================
-# Data Contract: raw_financial_facts
+# Data contract: bronze.raw_financial_facts
+# -----------------------------------------------------------------------------
+# A data contract is a promise from the producer (ingestion) to consumers
+# (dbt, detection, dashboard) about shape and quality. It is EXECUTED by
+# quality/check_contracts.py on every pipeline run and in CI: any rule with
+# level "error" that fails stops the pipeline before bad data reaches gold.
 # =============================================================================
-# Defines the schema, quality rules, and SLAs for the bronze-layer financial
-# facts table ingested from SEC EDGAR.  This contract is the single source of
-# truth for producers (ingestion) and consumers (dbt models, detection engine).
-# =============================================================================
-
-apiVersion: v1.0.0
 kind: DataContract
 metadata:
   name: raw-financial-facts
-  version: 1.0.0
-  owner: data-engineering-team
-  domain: financial-analytics
+  version: 2.0.0
+  owner: pipeline maintainer (solo self-directed project)
   description: >
-    Raw financial facts extracted from SEC EDGAR company filings.
-    Each row represents a single XBRL fact (metric + value + period) from
-    a 10-K, 10-Q, 8-K, or amended filing.
-  tags:
-    - financial
-    - sec-edgar
-    - bronze
-    - restatement-detection
+    XBRL facts from the SEC EDGAR companyfacts endpoint, one row per fact
+    as reported in one filing.
 
-schema:
-  type: table
-  database: warehouse
-  schema_name: bronze
-  table_name: raw_financial_facts
+table: bronze.raw_financial_facts
 
-  columns:
-    - name: fact_id
-      type: VARCHAR
-      nullable: false
-      description: "Surrogate key: SHA-256 of (cik, accession_number, metric, period_end)."
-      primary_key: true
+columns:
+  - {name: fact_key,         type: VARCHAR, nullable: false, unique: true}
+  - {name: cik,              type: VARCHAR, nullable: false, pattern: "^[0-9]{10}$"}
+  - {name: taxonomy,         type: VARCHAR, nullable: false, allowed_values: ["us-gaap", "dei"]}
+  - {name: metric,           type: VARCHAR, nullable: false}
+  - {name: unit,             type: VARCHAR, nullable: false}
+  - {name: period_start,     type: DATE,    nullable: true}
+  - {name: period_end,       type: DATE,    nullable: false}
+  - {name: value,            type: DOUBLE,  nullable: true}
+  - {name: filed_date,       type: DATE,    nullable: false}
+  - {name: accession_number, type: VARCHAR, nullable: false, pattern: "^[0-9]{10}-[0-9]{2}-[0-9]{6}$"}
+  - {name: ingested_at,      type: TIMESTAMP, nullable: false}
 
-    - name: cik
-      type: VARCHAR
-      nullable: false
-      description: "SEC Central Index Key — unique company identifier."
-      pattern: "^[0-9]+$"
+rules:
+  - name: period_order
+    level: error
+    condition: "period_start IS NULL OR period_end >= period_start"
+    description: A period cannot end before it starts.
 
-    - name: company_name
-      type: VARCHAR
-      nullable: false
-      description: "Registrant name as filed with the SEC."
-
-    - name: accession_number
-      type: VARCHAR
-      nullable: false
-      description: "SEC accession number uniquely identifying the filing."
-
-    - name: form
-      type: VARCHAR
-      nullable: false
-      description: "Filing form type."
-      allowed_values: ["10-K", "10-Q", "8-K", "10-K/A", "10-Q/A"]
-
-    - name: metric
-      type: VARCHAR
-      nullable: false
-      description: "XBRL taxonomy tag (e.g., us-gaap:Revenues)."
-
-    - name: value
-      type: DOUBLE
-      nullable: false
-      description: "Reported numeric value in USD (or unit specified by the tag)."
-
-    - name: unit
-      type: VARCHAR
-      nullable: true
-      description: "Unit of measure (USD, shares, pure)."
-
-    - name: period_start
-      type: DATE
-      nullable: true
-      description: "Start of the reporting period (null for instant facts)."
-
-    - name: period_end
-      type: DATE
-      nullable: false
-      description: "End of the reporting period."
-
-    - name: filed_date
-      type: DATE
-      nullable: false
-      description: "Date the filing was submitted to the SEC."
-
-    - name: ingested_at
-      type: TIMESTAMP
-      nullable: false
-      description: "UTC timestamp when the row was loaded into the warehouse."
-
-quality:
-  freshness:
-    max_delay: "24 hours"
-    measured_on: ingested_at
-    description: "Data must be no older than 24 hours from the latest SEC EDGAR update."
-
-  completeness:
-    threshold: 0.95
+  - name: filed_after_period
+    level: error
+    condition: "filed_date >= period_end - INTERVAL 400 DAY"
     description: >
-      At least 95% of expected rows must be present. Measured against
-      the count of filings available on EDGAR for watched CIKs.
+      Facts are filed after the period they describe. Cover-page facts
+      (shares outstanding) are dated close to the filing, so a generous window is used.
 
-  uniqueness:
-    columns: [fact_id]
-    description: "No duplicate facts — enforced via the surrogate key."
+  - name: value_present
+    level: warn
+    max_failure_rate: 0.01
+    condition: "value IS NOT NULL"
+    description: Almost every fact has a value.
 
-  validity:
-    rules:
-      - column: value
-        condition: "value IS NOT NULL"
-        description: "Every fact must have a reported value."
+  - name: usd_magnitude
+    level: warn
+    max_failure_rate: 0.001
+    condition: "unit <> 'USD' OR abs(value) < 1e13"
+    description: No single dollar figure above $10 trillion (catches unit errors).
 
-      - column: period_end
-        condition: "period_end >= period_start OR period_start IS NULL"
-        description: "Period end must be on or after period start."
+volume:
+  min_rows: 100
 
-      - column: form
-        condition: "form IN ('10-K','10-Q','8-K','10-K/A','10-Q/A')"
-        description: "Only accepted SEC form types."
-
-sla:
-  availability: "08:00 ET daily"
-  description: >
-    Downstream consumers (dbt silver models, anomaly detection) expect
-    fresh data by 8:00 AM Eastern Time every business day.
-
-lineage:
-  source:
-    system: SEC EDGAR
-    api: "https://data.sec.gov/api/xbrl/companyfacts/"
-    format: JSON
-  destination:
-    system: DuckDB (dev) / BigQuery (prod)
-    table: bronze.raw_financial_facts
-
-contacts:
-  - role: owner
-    team: data-engineering-team
-    slack: "#data-eng-alerts"
-  - role: consumer
-    team: financial-analytics
-    slack: "#fin-analytics"
+freshness:
+  column: ingested_at
+  max_age_hours: 30
+  description: Daily schedule plus a 6-hour grace period.

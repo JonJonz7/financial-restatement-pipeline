@@ -1,4 +1,4 @@
-severity,min_pct_change,min_absolute_change,description
-MATERIAL,5.0,1000000,"Change exceeds 5% or $1M"
-NOTABLE,1.0,100000,"Change exceeds 1% or $100K"
-MINOR,0.0,0,"Any detectable change"
+severity,severity_rank,min_pct_change,min_absolute_usd,description
+MATERIAL,3,5.0,1000000,"Change of at least 5%, or at least $1M for dollar amounts"
+NOTABLE,2,1.0,100000,"Change of at least 1%, or at least $100K for dollar amounts"
+MINOR,1,0.0,0,"Any detectable change"

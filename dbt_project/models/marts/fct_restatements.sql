@@ -1,55 +1,41 @@
 /*
     fct_restatements
     ---------------------------------------------------------------
-    Final restatement fact table.
+    Detected restatements with severity and type.
 
-    Business logic:
-      - Sources from int_filing_comparisons (which already filters
-        to rows where values differ between filings).
-      - Adds severity classification via the materiality_threshold
-        macro (MATERIAL / NOTABLE / MINOR).
-      - Computes days_to_restatement: the number of calendar days
-        between the original filing and the restatement filing.
-        Longer gaps may indicate the restatement was discovered
-        during a subsequent audit cycle.
-      - Generates a unique restatement_id for downstream joins.
+    restatement_type:
+      AMENDMENT  the new value came in an amended filing (10-K/A, 10-Q/A):
+                 the company formally corrected a report.
+      RECAST     the new value appeared as a comparative in a later regular
+                 report. Often a reclassification (e.g. discontinued
+                 operations), sometimes a quiet correction. Worth a look.
 
-    Grain: one row per (cik, metric, period_end, restatement_filed_date).
+    severity comes from the materiality_thresholds seed (see macros/severity.sql).
+    Grain: one row per value change (cik, taxonomy, metric, unit,
+    period_start, period_end, restatement_accession_number).
 */
-
-with restatements as (
-
-    select
-        -- Surrogate key for this restatement event
-        {{ generate_surrogate_key([
-            'cik',
-            'metric',
-            'period_end',
-            'restatement_filed_date'
-        ]) }} as restatement_id,
-
-        cik,
-        metric,
-        period_end,
-        original_value,
-        restated_value,
-        original_filed_date,
-        restatement_filed_date,
-        restatement_form_type,
-        restatement_accession_number,
-        absolute_change,
-        pct_change,
-
-        -- Calendar days between original filing and restatement
-        restatement_filed_date - original_filed_date
-            as days_to_restatement,
-
-        -- Severity classification using the reusable macro
-        {{ materiality_threshold('pct_change', 'absolute_change') }}
-            as severity
-
-    from {{ ref('int_filing_comparisons') }}
-
-)
-
-select * from restatements
+select
+    {{ generate_surrogate_key([
+        'cik', 'taxonomy', 'metric', 'unit', 'period_start', 'period_end',
+        'restatement_accession_number'
+    ]) }}                                                            as restatement_id,
+    cik,
+    taxonomy,
+    metric,
+    unit,
+    period_start,
+    period_end,
+    period_type,
+    original_value,
+    restated_value,
+    absolute_change,
+    pct_change,
+    original_filed_date,
+    restatement_filed_date,
+    original_accession_number,
+    restatement_accession_number,
+    restatement_form_type,
+    case when restatement_form_type like '%/A' then 'AMENDMENT' else 'RECAST' end as restatement_type,
+    date_diff('day', original_filed_date, restatement_filed_date)     as days_to_restatement,
+    {{ severity('pct_change', 'absolute_change', 'unit') }}          as severity
+from {{ ref('int_filing_comparisons') }}

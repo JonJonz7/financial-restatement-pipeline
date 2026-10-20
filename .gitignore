@@ -95,3 +95,9 @@ Thumbs.db
 *.key
 credentials.json
 service-account*.json
+
+# Pipeline outputs
+data/landing/
+reports/alerts.md
+.env
+dbt_project/.user.yml

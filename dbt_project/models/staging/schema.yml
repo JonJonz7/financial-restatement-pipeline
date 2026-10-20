@@ -2,103 +2,76 @@ version: 2
 
 sources:
   - name: bronze
-    description: >
-      Raw data ingested by the Python loader (ingestion/loader.py) into
-      the bronze schema of the DuckDB warehouse.
+    description: Raw rows loaded by ingestion/loader.py. Never edited by hand.
     schema: bronze
     tables:
+      - name: raw_companies
+        columns:
+          - name: cik
+            tests: [not_null, unique]
       - name: raw_filings
-        description: SEC EDGAR filing metadata (10-K, 10-Q, 10-K/A, etc.)
         columns:
           - name: accession_number
-            description: Unique SEC accession number for each filing
-            tests:
-              - not_null
+            tests: [not_null, unique]
           - name: cik
-            description: SEC Central Index Key identifying the filer
-            tests:
-              - not_null
-          - name: form_type
-            description: SEC form type
-            tests:
-              - not_null
-              - accepted_values:
-                  values:
-                    - "10-K"
-                    - "10-Q"
-                    - "10-K/A"
-                    - "10-Q/A"
-                    - "8-K"
-                    - "20-F"
-                    - "6-K"
-
+            tests: [not_null]
       - name: raw_financial_facts
-        description: XBRL financial fact values extracted from SEC filings
+        loaded_at_field: ingested_at
         columns:
-          - name: cik
-            tests:
-              - not_null
-          - name: metric
-            tests:
-              - not_null
+          - name: fact_key
+            tests: [not_null, unique]
           - name: period_end
-            tests:
-              - not_null
-
+            tests: [not_null]
       - name: raw_market_data
-        description: Daily market / pricing data for publicly traded tickers
         columns:
           - name: ticker
-            tests:
-              - not_null
-          - name: date
-            tests:
-              - not_null
+            tests: [not_null]
+      - name: ingestion_runs
+        description: Lineage. One row per source document loaded, with its SHA-256.
 
 models:
+  - name: stg_companies
+    description: Company profile from SEC submissions. One row per CIK.
+    columns:
+      - name: cik
+        tests: [not_null, unique]
+
   - name: stg_filings
-    description: >
-      Cleaned and deduplicated SEC filing metadata. One row per
-      accession_number.
+    description: Filing index. One row per accession number.
     columns:
       - name: accession_number
+        tests: [not_null, unique]
+      - name: form_type
         tests:
-          - unique
-          - not_null
+          - accepted_values:
+              values: ["10-K", "10-K/A", "10-Q", "10-Q/A"]
       - name: cik
         tests:
-          - not_null
-      - name: filed_date
-        tests:
-          - not_null
+          - relationships:
+              to: ref('stg_companies')
+              field: cik
 
   - name: stg_financial_facts
-    description: >
-      Cleaned financial facts with surrogate key. Null values filtered out.
+    description: One XBRL fact as reported in one filing.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [cik, taxonomy, metric, unit, period_start, period_end, accession_number]
     columns:
       - name: fact_key
-        description: >
-          Surrogate key: md5(cik || metric || period_end || filed_date)
+        tests: [not_null, unique]
+      - name: period_type
         tests:
-          - unique
-          - not_null
-      - name: cik
-        tests:
-          - not_null
-      - name: metric
-        tests:
-          - not_null
-      - name: value
-        tests:
-          - not_null
+          - accepted_values:
+              values: ["instant", "quarter", "year", "other"]
 
   - name: stg_market_data
-    description: >
-      Cleaned and deduplicated market data. One row per (ticker, date).
+    description: Daily prices. One row per ticker per trading day.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [ticker, trade_date]
     columns:
-      - name: ticker
+      - name: close_price
         tests:
-          - not_null
-      - name: date
-        tests:
-          - not_null
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false

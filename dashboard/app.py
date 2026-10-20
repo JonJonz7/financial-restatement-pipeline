@@ -1,498 +1,221 @@
 """
-Financial Restatement Monitor — Streamlit Dashboard
-=====================================================
-Interactive monitoring dashboard for the Financial Restatement &
-Anomaly Detection Pipeline.  Connects to the DuckDB warehouse to
-display detected restatements, anomaly scores, and data-quality
-status across the bronze/silver/gold medallion layers.
+Financial Restatement Monitor (Streamlit).
+
+    make dashboard                                         # warehouse.duckdb
+    WAREHOUSE_DB_PATH=demo.duckdb make dashboard           # after `make demo`
+
+Read-only view over the gold layer: the scored alert queue, restatements,
+other anomalies, one company at a time, and pipeline health (lineage and
+row counts). It never writes to the warehouse.
 """
 
 import os
+from pathlib import Path
 
 import duckdb
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-# ---------------------------------------------------------------------------
-# Page configuration
-# ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Financial Restatement Monitor",
-    page_icon="$",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DB = ROOT / "warehouse.duckdb"
+if not DEFAULT_DB.exists() and (ROOT / "demo.duckdb").exists():
+    DEFAULT_DB = ROOT / "demo.duckdb"
+DB_PATH = os.getenv("WAREHOUSE_DB_PATH", str(DEFAULT_DB))
 
-# ---------------------------------------------------------------------------
-# Custom dark theme styling
-# ---------------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-    .metric-card {
-        background-color: #1e1e2e;
-        border: 1px solid #313244;
-        border-radius: 8px;
-        padding: 20px;
-        text-align: center;
-    }
-    .metric-value {
-        font-size: 2.4rem;
-        font-weight: 700;
-        color: #cdd6f4;
-        margin: 0;
-    }
-    .metric-label {
-        font-size: 0.85rem;
-        color: #a6adc8;
-        margin-top: 4px;
-    }
-    .section-header {
-        border-bottom: 2px solid #313244;
-        padding-bottom: 8px;
-        margin-bottom: 16px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.set_page_config(page_title="Restatement Monitor", layout="wide")
 
 
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-st.sidebar.title("Configuration")
-db_path = st.sidebar.text_input(
-    "DuckDB Path",
-    value=os.getenv("DUCKDB_PATH", "warehouse.duckdb"),
-)
-refresh = st.sidebar.button("Refresh Data")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    "**Financial Restatement Monitor**\n\n"
-    "Monitors SEC EDGAR filings for value changes across "
-    "reporting periods and flags anomalies for review."
-)
-
-
-# ---------------------------------------------------------------------------
-# Database connection helpers
-# ---------------------------------------------------------------------------
-
-
-@st.cache_resource(ttl=300)
-def get_connection(path: str):
-    """Return a read-only DuckDB connection (cached for 5 minutes)."""
-    return duckdb.connect(path, read_only=True)
-
-
-def table_exists(con, schema: str, table: str) -> bool:
-    """Check if a table exists in the given schema."""
+@st.cache_data(ttl=300)
+def query(sql: str) -> pd.DataFrame:
     try:
-        result = con.execute(
-            "SELECT COUNT(*) FROM information_schema.tables "
-            "WHERE table_schema = ? AND table_name = ?",
-            [schema, table],
-        ).fetchone()
-        return result[0] > 0
-    except Exception:
-        return False
-
-
-def safe_query(con, sql: str) -> pd.DataFrame:
-    """Execute a query and return a DataFrame; return empty on error."""
+        con = duckdb.connect(DB_PATH, read_only=True)
+    except duckdb.Error as exc:
+        st.error(f"Can't open {DB_PATH}: {exc}")
+        return pd.DataFrame()
     try:
         return con.execute(sql).fetchdf()
-    except Exception:
+    except duckdb.Error:
         return pd.DataFrame()
+    finally:
+        con.close()
 
-
-def get_row_count(con, schema: str, table: str) -> int:
-    """Get the row count for a schema.table."""
-    try:
-        result = con.execute(f"SELECT COUNT(*) FROM {schema}.{table}").fetchone()
-        return result[0]
-    except Exception:
-        return 0
-
-
-def get_freshness(con, schema: str, table: str) -> str:
-    """Get the latest ingested_at timestamp for a table."""
-    try:
-        result = con.execute(
-            f"SELECT MAX(ingested_at) FROM {schema}.{table}"
-        ).fetchone()
-        return str(result[0]) if result[0] else "N/A"
-    except Exception:
-        return "N/A"
-
-
-# ---------------------------------------------------------------------------
-# Main dashboard
-# ---------------------------------------------------------------------------
-if refresh:
-    st.cache_resource.clear()
 
 st.title("Financial Restatement Monitor")
+st.caption(f"Warehouse: `{DB_PATH}` · read-only")
 
-try:
-    con = get_connection(db_path)
-except Exception as e:
-    st.error(f"Cannot connect to DuckDB at `{db_path}`: {e}")
-    st.info("Run the pipeline first:  `make pipeline`")
-    st.stop()
+alerts = query(
+    """
+    select priority_score, ticker, company_name, anomaly_type, metric, period_end,
+           actual_value, expected_value, pct_change, severity, detected_date,
+           recommended_action, risk_factors
+    from gold.alerts order by priority_score desc
+"""
+)
+restatements = query(
+    """
+    select r.*, c.ticker, c.company_name
+    from gold.fct_restatements r left join gold.dim_companies c using (cik)
+"""
+)
+companies = query("select * from gold.dim_companies order by ticker")
 
-# Check if the gold layer tables exist
-has_restatements = table_exists(con, "gold", "fct_restatements")
-has_anomalies = table_exists(con, "gold", "fct_anomalies")
-has_bronze = table_exists(con, "bronze", "raw_financial_facts")
-
-if not has_bronze:
+if alerts.empty and restatements.empty:
     st.warning(
-        "No data found in the warehouse. Run the pipeline first to ingest data."
+        "No gold data yet. Run `make demo` (sample data) or `make pipeline` (live)."
     )
-    st.code("make setup\nmake ingest\nmake transform\nmake detect", language="bash")
     st.stop()
 
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Companies", len(companies))
+c2.metric("Restatements", len(restatements))
+c3.metric(
+    "Material",
+    int((restatements.get("severity") == "MATERIAL").sum())
+    if not restatements.empty
+    else 0,
+)
+c4.metric(
+    "Immediate review",
+    int((alerts["priority_score"] >= 70).sum()) if not alerts.empty else 0,
+)
 
-# ===================================================================
-# a. KPI Strip
-# ===================================================================
-st.markdown('<div class="section-header"><h2>Overview</h2></div>', unsafe_allow_html=True)
+tab_queue, tab_rest, tab_company, tab_health = st.tabs(
+    ["Alert queue", "Restatements", "Company", "Pipeline health"]
+)
 
-kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
-
-# Total companies monitored
-companies_count = 0
-try:
-    result = con.execute(
-        "SELECT COUNT(DISTINCT cik) FROM bronze.raw_financial_facts"
-    ).fetchone()
-    companies_count = result[0]
-except Exception:
-    pass
-
-# Total restatements detected
-restatements_count = 0
-if has_restatements:
-    try:
-        result = con.execute("SELECT COUNT(*) FROM gold.fct_restatements").fetchone()
-        restatements_count = result[0]
-    except Exception:
-        pass
-
-# Material restatements
-material_count = 0
-if has_restatements:
-    try:
-        result = con.execute(
-            "SELECT COUNT(*) FROM gold.fct_restatements WHERE severity = 'MATERIAL'"
-        ).fetchone()
-        material_count = result[0]
-    except Exception:
-        pass
-
-# Avg days to detect
-avg_days = 0
-if has_restatements:
-    try:
-        result = con.execute(
-            "SELECT AVG(days_to_restatement) FROM gold.fct_restatements "
-            "WHERE days_to_restatement IS NOT NULL"
-        ).fetchone()
-        avg_days = round(result[0]) if result[0] else 0
-    except Exception:
-        pass
-
-with kpi_col1:
-    st.markdown(
-        f'<div class="metric-card">'
-        f'<p class="metric-value">{companies_count:,}</p>'
-        f'<p class="metric-label">Companies Monitored</p>'
-        f'</div>',
-        unsafe_allow_html=True,
+with tab_queue:
+    st.subheader("What to review first")
+    types = sorted(alerts["anomaly_type"].unique()) if not alerts.empty else []
+    chosen = st.multiselect("Anomaly types", types, default=types)
+    view = alerts[alerts["anomaly_type"].isin(chosen)] if chosen else alerts
+    st.dataframe(
+        view,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "priority_score": st.column_config.ProgressColumn(
+                "Priority", min_value=0, max_value=100, format="%d"
+            )
+        },
     )
 
-with kpi_col2:
-    st.markdown(
-        f'<div class="metric-card">'
-        f'<p class="metric-value">{restatements_count:,}</p>'
-        f'<p class="metric-label">Restatements Detected</p>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-with kpi_col3:
-    st.markdown(
-        f'<div class="metric-card">'
-        f'<p class="metric-value">{material_count:,}</p>'
-        f'<p class="metric-label">Material Restatements</p>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-with kpi_col4:
-    st.markdown(
-        f'<div class="metric-card">'
-        f'<p class="metric-value">{avg_days:,}</p>'
-        f'<p class="metric-label">Avg Days to Detect</p>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-st.markdown("<br>", unsafe_allow_html=True)
-
-# ===================================================================
-# b. Restatement Timeline + c. Severity Distribution
-# ===================================================================
-if has_restatements and restatements_count > 0:
-    chart_col, pie_col = st.columns([2, 1])
-
-    restatement_df = safe_query(
-        con,
-        """
-        SELECT
-            cik,
-            metric,
-            period_end,
-            original_value,
-            restated_value,
-            restatement_filed_date,
-            absolute_change,
-            pct_change,
-            severity,
-            days_to_restatement
-        FROM gold.fct_restatements
-        ORDER BY restatement_filed_date DESC
-        """,
-    )
-
-    with chart_col:
-        st.subheader("Restatement Timeline")
-        if not restatement_df.empty:
-            fig_timeline = px.scatter(
-                restatement_df,
+with tab_rest:
+    if restatements.empty:
+        st.info("No restatements detected.")
+    else:
+        left, right = st.columns(2)
+        left.plotly_chart(
+            px.histogram(
+                restatements,
+                x="severity",
+                color="restatement_type",
+                title="Restatements by severity and type",
+            ),
+            use_container_width=True,
+        )
+        right.plotly_chart(
+            px.scatter(
+                restatements,
                 x="restatement_filed_date",
                 y="pct_change",
                 color="severity",
-                size="absolute_change",
-                hover_data=["cik", "metric", "original_value", "restated_value"],
-                color_discrete_map={
-                    "MATERIAL": "#f38ba8",
-                    "NOTABLE": "#fab387",
-                    "MINOR": "#a6e3a1",
-                },
-                labels={
-                    "restatement_filed_date": "Restatement Filed Date",
-                    "pct_change": "Percentage Change (%)",
-                    "severity": "Severity",
-                },
-            )
-            fig_timeline.update_layout(
-                template="plotly_dark",
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                height=400,
-            )
-            st.plotly_chart(fig_timeline, use_container_width=True)
-        else:
-            st.info("No restatement data to display.")
-
-    with pie_col:
-        st.subheader("Severity Distribution")
-        if not restatement_df.empty:
-            severity_counts = restatement_df["severity"].value_counts().reset_index()
-            severity_counts.columns = ["severity", "count"]
-            fig_pie = px.pie(
-                severity_counts,
-                values="count",
-                names="severity",
-                color="severity",
-                color_discrete_map={
-                    "MATERIAL": "#f38ba8",
-                    "NOTABLE": "#fab387",
-                    "MINOR": "#a6e3a1",
-                },
-            )
-            fig_pie.update_layout(
-                template="plotly_dark",
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-                height=400,
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
-        else:
-            st.info("No severity data to display.")
-else:
-    st.info(
-        "No restatements detected yet. Run `make transform` and `make detect` "
-        "after ingesting data."
-    )
-
-# ===================================================================
-# d. Top Anomalies
-# ===================================================================
-st.markdown("---")
-st.subheader("Top Anomalies")
-
-if has_anomalies:
-    anomalies_df = safe_query(
-        con,
-        """
-        SELECT
-            anomaly_id,
-            anomaly_type,
-            cik,
-            metric,
-            period_end,
-            expected_value,
-            actual_value,
-            absolute_change,
-            pct_change,
-            severity,
-            severity_score,
-            detected_date
-        FROM gold.fct_anomalies
-        ORDER BY severity_score DESC
-        LIMIT 20
-        """,
-    )
-    if not anomalies_df.empty:
+                hover_data=["ticker", "metric", "period_end"],
+                title="When they were filed, and how big",
+            ),
+            use_container_width=True,
+        )
         st.dataframe(
-            anomalies_df,
+            restatements[
+                [
+                    "ticker",
+                    "metric",
+                    "period_start",
+                    "period_end",
+                    "original_value",
+                    "restated_value",
+                    "pct_change",
+                    "severity",
+                    "restatement_type",
+                    "restatement_form_type",
+                    "days_to_restatement",
+                ]
+            ],
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "severity_score": st.column_config.ProgressColumn(
-                    "Severity Score",
-                    min_value=0,
-                    max_value=100,
-                    format="%d",
-                ),
-                "expected_value": st.column_config.NumberColumn(format="$%,.0f"),
-                "actual_value": st.column_config.NumberColumn(format="$%,.0f"),
-                "absolute_change": st.column_config.NumberColumn(format="$%,.0f"),
-                "pct_change": st.column_config.NumberColumn(format="%.2f%%"),
-            },
         )
+
+with tab_company:
+    if companies.empty:
+        st.info("No companies loaded.")
     else:
-        st.info("No anomalies found in the gold layer.")
-else:
-    st.info("Anomalies table not yet created. Run `make transform` to build gold layer models.")
-
-# ===================================================================
-# e. Company Deep Dive
-# ===================================================================
-st.markdown("---")
-st.subheader("Company Deep Dive")
-
-# Get list of companies with data
-company_df = safe_query(
-    con,
-    "SELECT DISTINCT cik FROM bronze.raw_financial_facts ORDER BY cik",
-)
-
-if not company_df.empty:
-    selected_cik = st.selectbox(
-        "Select a Company (CIK)",
-        options=company_df["cik"].tolist(),
-    )
-
-    if selected_cik:
-        dive_col1, dive_col2 = st.columns(2)
-
-        with dive_col1:
-            st.markdown("**Restatements**")
-            if has_restatements:
-                company_restatements = safe_query(
-                    con,
-                    f"""
-                    SELECT
-                        metric,
-                        period_end,
-                        original_value,
-                        restated_value,
-                        pct_change,
-                        severity,
-                        restatement_filed_date,
-                        days_to_restatement
-                    FROM gold.fct_restatements
-                    WHERE cik = '{selected_cik}'
-                    ORDER BY restatement_filed_date DESC
-                    """,
-                )
-                if not company_restatements.empty:
-                    st.dataframe(company_restatements, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No restatements found for this company.")
-            else:
-                st.info("Restatements table not available.")
-
-        with dive_col2:
-            st.markdown("**Filing History**")
-            company_filings = safe_query(
-                con,
-                f"""
-                SELECT
-                    form_type,
-                    filing_date,
-                    period_of_report,
-                    accession_number
-                FROM bronze.raw_filings
-                WHERE cik = '{selected_cik}'
-                ORDER BY filing_date DESC
-                LIMIT 20
-                """,
+        ticker = st.selectbox("Company", companies["ticker"].tolist())
+        row = companies[companies["ticker"] == ticker].iloc[0]
+        st.write(
+            f"**{row['company_name']}** · CIK {row['cik']} · {row['sic_description']} · "
+            f"{row['total_filings']} filings ({row['amendment_filings']} amendments)"
+        )
+        rev = query(
+            f"""
+            select period_end, revenue, is_derived from silver.int_quarterly_revenue
+            where cik = '{row['cik']}' order by period_end
+        """
+        )
+        if not rev.empty:
+            st.plotly_chart(
+                px.bar(
+                    rev,
+                    x="period_end",
+                    y="revenue",
+                    color="is_derived",
+                    title="Quarterly revenue (latest filed version; Q4 derived if untagged)",
+                ),
+                use_container_width=True,
             )
-            if not company_filings.empty:
-                st.dataframe(company_filings, use_container_width=True, hide_index=True)
-            else:
-                st.info("No filings found for this company.")
-else:
-    st.info("No company data available.")
+        val = query(
+            f"""
+            select period_end, price_to_sales, robust_z, is_outlier from silver.int_market_valuation
+            where cik = '{row['cik']}' order by period_end
+        """
+        )
+        if not val.empty:
+            st.plotly_chart(
+                px.line(
+                    val,
+                    x="period_end",
+                    y="price_to_sales",
+                    markers=True,
+                    log_y=True,
+                    title="Price-to-sales (log scale)",
+                ),
+                use_container_width=True,
+            )
+        st.dataframe(
+            alerts[alerts["ticker"] == ticker],
+            use_container_width=True,
+            hide_index=True,
+        )
 
-# ===================================================================
-# f. Data Quality Status
-# ===================================================================
-st.markdown("---")
-st.subheader("Data Quality Status")
-
-qual_col1, qual_col2, qual_col3 = st.columns(3)
-
-with qual_col1:
-    st.markdown("**Bronze Layer (Raw)**")
-    bronze_tables = ["raw_filings", "raw_financial_facts", "raw_market_data"]
-    for tbl in bronze_tables:
-        count = get_row_count(con, "bronze", tbl)
-        freshness = get_freshness(con, "bronze", tbl)
-        st.metric(label=f"bronze.{tbl}", value=f"{count:,} rows")
-        st.caption(f"Last ingested: {freshness}")
-
-with qual_col2:
-    st.markdown("**Silver Layer (Cleaned)**")
-    silver_tables = ["stg_filings", "stg_financial_facts", "stg_market_data"]
-    for tbl in silver_tables:
-        if table_exists(con, "silver", tbl):
-            count = get_row_count(con, "silver", tbl)
-            st.metric(label=f"silver.{tbl}", value=f"{count:,} rows")
-        else:
-            st.metric(label=f"silver.{tbl}", value="Not built")
-            st.caption("Run `make transform`")
-
-with qual_col3:
-    st.markdown("**Gold Layer (Analytics)**")
-    gold_tables = [
-        "fct_restatements",
-        "fct_anomalies",
-        "dim_companies",
-        "dim_filing_periods",
-    ]
-    for tbl in gold_tables:
-        if table_exists(con, "gold", tbl):
-            count = get_row_count(con, "gold", tbl)
-            st.metric(label=f"gold.{tbl}", value=f"{count:,} rows")
-        else:
-            st.metric(label=f"gold.{tbl}", value="Not built")
-            st.caption("Run `make transform`")
+with tab_health:
+    st.subheader("Lineage: what was loaded, from which exact file")
+    st.dataframe(
+        query(
+            """
+        select source, cik, status, rows_loaded, sha256, landed_path, finished_at, error
+        from bronze.ingestion_runs order by finished_at desc limit 200
+    """
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    counts = query(
+        """
+        select 'bronze.raw_financial_facts' as table_name, count(*) as row_count from bronze.raw_financial_facts
+        union all select 'bronze.raw_filings', count(*) from bronze.raw_filings
+        union all select 'bronze.raw_market_data', count(*) from bronze.raw_market_data
+        union all select 'gold.fct_restatements', count(*) from gold.fct_restatements
+        union all select 'gold.fct_anomalies', count(*) from gold.fct_anomalies
+        union all select 'gold.alerts', count(*) from gold.alerts
+    """
+    )
+    st.dataframe(counts, hide_index=True)

@@ -11,13 +11,16 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    # The stock Airflow image has none of the pipeline's libraries; install them at start-up.
+    _PIP_ADDITIONAL_REQUIREMENTS: "duckdb==0.10.1 pyarrow==15.0.2 pandas==2.2.0 requests==2.31.0 yfinance==0.2.36 pyyaml==6.0.1 dbt-duckdb==1.7.3 great-expectations==0.18.8"
+    EDGAR_USER_AGENT: ${EDGAR_USER_AGENT:-}
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
     AIRFLOW__WEBSERVER__SECRET_KEY: 'change-me-in-production'
     AIRFLOW__CORE__DEFAULT_TIMEZONE: 'America/New_York'
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
     # Pipeline-specific
-    DUCKDB_PATH: /data/warehouse.duckdb
+    WAREHOUSE_DB_PATH: /data/warehouse.duckdb
     DBT_PROJECT_DIR: /opt/airflow/dbt_project
     DBT_PROFILES_DIR: /opt/airflow/dbt_project
     PYTHONPATH: /opt/airflow
@@ -27,6 +30,7 @@ x-airflow-common: &airflow-common
     - ./ingestion:/opt/airflow/ingestion
     - ./detection:/opt/airflow/detection
     - ./quality:/opt/airflow/quality
+    - ./data:/opt/airflow/data
     - warehouse-data:/data
     - airflow-logs:/opt/airflow/logs
   networks:
@@ -39,13 +43,13 @@ services:
   warehouse:
     image: alpine:3.19
     command: >
-      sh -c "mkdir -p /data && touch /data/warehouse.duckdb && echo 'DuckDB volume ready' && tail -f /dev/null"
+      sh -c "mkdir -p /data && echo DuckDB volume ready && tail -f /dev/null"
     volumes:
       - warehouse-data:/data
     networks:
       - pipeline-net
     healthcheck:
-      test: ["CMD", "test", "-f", "/data/warehouse.duckdb"]
+      test: ["CMD", "test", "-d", "/data"]
       interval: 10s
       retries: 3
 
@@ -115,7 +119,7 @@ services:
     ports:
       - "8501:8501"
     environment:
-      DUCKDB_PATH: /data/warehouse.duckdb
+      WAREHOUSE_DB_PATH: /data/warehouse.duckdb
     volumes:
       - ./dashboard:/app/dashboard
       - warehouse-data:/data

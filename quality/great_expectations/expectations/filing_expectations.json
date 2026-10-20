@@ -1,80 +1,22 @@
 {
   "expectation_suite_name": "raw_financial_facts_suite",
-  "ge_cloud_id": null,
   "meta": {
-    "great_expectations_version": "0.18.8",
-    "citations": [
-      {
-        "citation_date": "2024-01-15",
-        "comment": "Baseline expectations for SEC EDGAR financial facts in the bronze layer."
-      }
-    ]
+    "table": "bronze.raw_financial_facts",
+    "notes": "Statistical expectations. Run by quality/run_expectations.py. 'mostly' allows a small share of exceptions, because real SEC data has some (e.g. rare form types)."
   },
   "expectations": [
-    {
-      "expectation_type": "expect_column_values_to_not_be_null",
-      "kwargs": { "column": "cik" },
-      "meta": { "notes": "CIK is the SEC company identifier — must always be present." }
-    },
-    {
-      "expectation_type": "expect_column_values_to_not_be_null",
-      "kwargs": { "column": "metric" },
-      "meta": { "notes": "XBRL metric tag (e.g., us-gaap:Revenue) — required for all facts." }
-    },
-    {
-      "expectation_type": "expect_column_values_to_not_be_null",
-      "kwargs": { "column": "value" },
-      "meta": { "notes": "Reported numeric value — the core data point." }
-    },
-    {
-      "expectation_type": "expect_column_values_to_not_be_null",
-      "kwargs": { "column": "period_end" },
-      "meta": { "notes": "Period end date defines the reporting window." }
-    },
-    {
-      "expectation_type": "expect_column_values_to_match_regex",
-      "kwargs": {
-        "column": "cik",
-        "regex": "^[0-9]+$"
-      },
-      "meta": { "notes": "CIK must be numeric (SEC assigns integer identifiers)." }
-    },
-    {
-      "expectation_type": "expect_column_values_to_be_in_set",
-      "kwargs": {
-        "column": "form",
-        "value_set": ["10-K", "10-Q", "8-K", "10-K/A", "10-Q/A"]
-      },
-      "meta": { "notes": "Only ingest forms relevant to financial restatement detection." }
-    },
-    {
-      "expectation_type": "expect_column_values_to_be_between",
-      "kwargs": {
-        "column": "value",
-        "min_value": 0,
-        "mostly": 0.90
-      },
-      "meta": {
-        "notes": "Most financial metrics (Revenue, Assets, etc.) are non-negative. The 'mostly' threshold allows for legitimate negative values (e.g., Net Income losses) without failing the suite."
-      }
-    },
-    {
-      "expectation_type": "expect_table_row_count_to_be_between",
-      "kwargs": {
-        "min_value": 100
-      },
-      "meta": { "notes": "Sanity check — each incremental load should yield meaningful data volume." }
-    },
-    {
-      "expectation_type": "expect_column_pair_values_A_to_be_greater_than_B",
-      "kwargs": {
-        "column_A": "period_end",
-        "column_B": "period_start",
-        "or_equal": false,
-        "ignore_row_if": "either_value_is_missing"
-      },
-      "meta": { "notes": "Period end must follow period start where both are present." }
-    }
-  ],
-  "data_asset_type": null
+    {"expectation_type": "expect_table_row_count_to_be_between", "kwargs": {"min_value": 100}},
+    {"expectation_type": "expect_column_values_to_not_be_null", "kwargs": {"column": "cik"}},
+    {"expectation_type": "expect_column_values_to_not_be_null", "kwargs": {"column": "metric"}},
+    {"expectation_type": "expect_column_values_to_not_be_null", "kwargs": {"column": "period_end"}},
+    {"expectation_type": "expect_column_values_to_not_be_null", "kwargs": {"column": "value", "mostly": 0.99}},
+    {"expectation_type": "expect_column_values_to_match_regex", "kwargs": {"column": "cik", "regex": "^[0-9]{10}$"}},
+    {"expectation_type": "expect_column_values_to_be_in_set",
+     "kwargs": {"column": "form", "value_set": ["10-K", "10-Q", "10-K/A", "10-Q/A", "8-K", "10-KT", "20-F", "S-1", "S-4"], "mostly": 0.98}},
+    {"expectation_type": "expect_column_values_to_be_unique", "kwargs": {"column": "fact_key"}},
+    {"expectation_type": "expect_column_pair_values_A_to_be_greater_than_B",
+     "kwargs": {"column_A": "period_end", "column_B": "period_start", "or_equal": false, "ignore_row_if": "either_value_is_missing"}},
+    {"expectation_type": "expect_column_proportion_of_unique_values_to_be_between",
+     "kwargs": {"column": "accession_number", "max_value": 0.5}}
+  ]
 }
