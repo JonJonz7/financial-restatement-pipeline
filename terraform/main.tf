@@ -185,9 +185,9 @@ resource "google_cloudfunctions2_function" "edgar_ingestion" {
     service_account_email = google_service_account.pipeline_sa.email
 
     environment_variables = {
-      RAW_BUCKET     = google_storage_bucket.raw_filings.name
-      BQ_DATASET     = google_bigquery_dataset.bronze.dataset_id
-      GCP_PROJECT    = var.project_id
+      RAW_BUCKET       = google_storage_bucket.raw_filings.name
+      BQ_DATASET       = google_bigquery_dataset.bronze.dataset_id
+      GCP_PROJECT      = var.project_id
       EDGAR_USER_AGENT = var.edgar_user_agent
     }
   }
